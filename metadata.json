@@ -1,0 +1,5 @@
+{
+  "name": "Procedural Logic Engine v46",
+  "description": "A node-based interface to automate and transform Adobe Photoshop files using procedural logic.",
+  "requestFramePermissions": []
+}
