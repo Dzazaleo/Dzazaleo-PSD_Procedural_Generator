@@ -3,7 +3,7 @@
 /**
  * AI Provider Service
  *
- * Abstraction layer for AI inference providers (Gemini, Qwen2.5-VL via vLLM, etc.)
+ * Abstraction layer for AI inference providers (Gemini, Qwen2.5-VL via Ollama, etc.)
  * Allows switching between cloud and local models without changing node code.
  */
 
@@ -11,7 +11,7 @@ export type AIProvider = 'gemini' | 'qwen-local' | 'qwen-comfyui';
 
 export interface AIProviderConfig {
   provider: AIProvider;
-  baseUrl?: string;        // For local servers (e.g., http://localhost:8000/v1)
+  baseUrl?: string;        // For local servers (e.g., http://localhost:11434/v1 for Ollama)
   apiKey?: string;         // For cloud providers
   model?: string;          // Model identifier
   comfyuiUrl?: string;     // For ComfyUI image generation
@@ -55,11 +55,12 @@ export interface GenerateResult {
 }
 
 // Default configuration - can be overridden via environment variables
+// Note: minicpm-v:8b is used as the default because qwen2.5vl:7b crashes with images
 const DEFAULT_CONFIG: AIProviderConfig = {
   provider: (import.meta.env.VITE_AI_PROVIDER as AIProvider) || 'gemini',
-  baseUrl: import.meta.env.VITE_QWEN_BASE_URL || 'http://localhost:8000/v1',
+  baseUrl: import.meta.env.VITE_QWEN_BASE_URL || 'http://localhost:11434/v1',
   apiKey: import.meta.env.VITE_API_KEY,
-  model: import.meta.env.VITE_QWEN_MODEL || 'Qwen/Qwen2.5-VL-7B-Instruct',
+  model: import.meta.env.VITE_QWEN_MODEL || 'minicpm-v:8b',
   comfyuiUrl: import.meta.env.VITE_COMFYUI_URL || 'http://127.0.0.1:8188',
 };
 
@@ -73,12 +74,107 @@ export function getAIProviderConfig(): AIProviderConfig {
   return { ...currentConfig };
 }
 
+// Maximum image dimension for local vision models (reduces VRAM usage)
+// 512px provides good balance for layout analysis with 24GB VRAM
+const MAX_IMAGE_DIMENSION = 512;
 
 /**
- * Generate completion using Qwen2.5-VL via vLLM (OpenAI-compatible API)
+ * Downscale a base64 image to reduce VRAM usage for local vision models
+ * Returns the original if already small enough or if processing fails
+ */
+async function downscaleImageForOllama(dataUrl: string): Promise<string> {
+  try {
+    // Extract base64 and mime type
+    const match = dataUrl.match(/^data:([^;]+);base64,(.+)$/);
+    if (!match) return dataUrl;
+
+    const [, mimeType, base64Data] = match;
+
+    // Create image element
+    const img = new Image();
+    await new Promise<void>((resolve, reject) => {
+      img.onload = () => resolve();
+      img.onerror = reject;
+      img.src = dataUrl;
+    });
+
+    // Check if downscaling needed
+    const { width, height } = img;
+    if (width <= MAX_IMAGE_DIMENSION && height <= MAX_IMAGE_DIMENSION) {
+      return dataUrl; // Already small enough
+    }
+
+    // Calculate new dimensions maintaining aspect ratio
+    // CRITICAL: Qwen2.5-VL GGML requires dimensions divisible by 28 (2×patch_size)
+    // The error "a->ne[2] * 4 == b->ne[0]" indicates attention head dimension mismatch
+    const PATCH_SIZE = 28;
+    const scale = Math.min(MAX_IMAGE_DIMENSION / width, MAX_IMAGE_DIMENSION / height);
+    let newWidth = Math.round(width * scale / PATCH_SIZE) * PATCH_SIZE || PATCH_SIZE;
+    let newHeight = Math.round(height * scale / PATCH_SIZE) * PATCH_SIZE || PATCH_SIZE;
+
+    // Ensure minimum size (at least 4 patches in each dimension)
+    const MIN_SIZE = PATCH_SIZE * 4;  // 112px minimum
+    newWidth = Math.max(newWidth, MIN_SIZE);
+    newHeight = Math.max(newHeight, MIN_SIZE);
+
+    // Create offscreen canvas and draw scaled image
+    const canvas = document.createElement('canvas');
+    canvas.width = newWidth;
+    canvas.height = newHeight;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return dataUrl;
+
+    ctx.drawImage(img, 0, 0, newWidth, newHeight);
+
+    // Convert back to base64 (use JPEG for better compression)
+    const outputMime = mimeType === 'image/png' ? 'image/png' : 'image/jpeg';
+    const quality = outputMime === 'image/jpeg' ? 0.85 : undefined;
+    const result = canvas.toDataURL(outputMime, quality);
+
+    console.log(`[aiProviderService] Downscaled image from ${width}x${height} to ${newWidth}x${newHeight} (divisible by ${PATCH_SIZE}: w=${newWidth % PATCH_SIZE === 0}, h=${newHeight % PATCH_SIZE === 0})`);
+    return result;
+  } catch (e) {
+    console.warn('[aiProviderService] Failed to downscale image, using original:', e);
+    return dataUrl;
+  }
+}
+
+/**
+ * Process content parts to downscale any images for Ollama
+ */
+async function processContentForOllama(content: ContentPart[]): Promise<ContentPart[]> {
+  const processed: ContentPart[] = [];
+  let imageCount = 0;
+
+  for (const part of content) {
+    if (part.type === 'image_url' && part.image_url?.url) {
+      imageCount++;
+      const downscaledUrl = await downscaleImageForOllama(part.image_url.url);
+      processed.push({
+        ...part,
+        image_url: {
+          ...part.image_url,
+          url: downscaledUrl
+        }
+      });
+    } else {
+      processed.push(part);
+    }
+  }
+
+  console.log(`[Qwen] Processed ${imageCount} images in content`);
+  return processed;
+}
+
+/**
+ * Generate completion using Qwen2.5-VL via Ollama (OpenAI-compatible API)
  */
 async function generateWithQwenLocal(options: GenerateOptions): Promise<GenerateResult> {
   const { baseUrl, model } = currentConfig;
+
+  // Debug: Log request info to console
+  console.log('[Qwen] Starting request to:', baseUrl);
+  console.log('[Qwen] Model:', model);
 
   // Build messages array with system prompt
   const messages: any[] = [];
@@ -90,7 +186,7 @@ async function generateWithQwenLocal(options: GenerateOptions): Promise<Generate
     });
   }
 
-  // Convert messages to OpenAI format
+  // Convert messages to OpenAI format with image downscaling
   for (const msg of options.messages) {
     if (typeof msg.content === 'string') {
       messages.push({
@@ -98,10 +194,11 @@ async function generateWithQwenLocal(options: GenerateOptions): Promise<Generate
         content: msg.content
       });
     } else {
-      // Handle multimodal content (images + text)
+      // Handle multimodal content (images + text) - downscale images for VRAM efficiency
+      const processedContent = await processContentForOllama(msg.content);
       messages.push({
         role: msg.role === 'assistant' ? 'assistant' : 'user',
-        content: msg.content
+        content: processedContent
       });
     }
   }
@@ -112,16 +209,19 @@ async function generateWithQwenLocal(options: GenerateOptions): Promise<Generate
     messages: messages,
     max_tokens: options.maxTokens || 4096,
     temperature: options.temperature ?? 0.7,
+    // Ollama-specific: increase context window (default is only 2048)
+    // 16384 tokens uses more VRAM but allows complex prompts
+    options: {
+      num_ctx: 16384
+    }
   };
 
   // Add structured output guidance if schema provided
   if (options.responseSchema) {
-    // vLLM supports guided_json for structured output
-    requestBody.extra_body = {
-      guided_json: JSON.stringify(options.responseSchema)
-    };
+    // Ollama supports JSON mode via response_format
+    requestBody.response_format = { type: 'json_object' };
 
-    // Also add JSON instruction to system prompt
+    // Add JSON instruction with schema to system prompt for guidance
     const schemaHint = `\n\nIMPORTANT: You MUST respond with valid JSON matching this schema:\n${JSON.stringify(options.responseSchema, null, 2)}`;
     if (messages[0]?.role === 'system') {
       messages[0].content += schemaHint;
@@ -130,11 +230,28 @@ async function generateWithQwenLocal(options: GenerateOptions): Promise<Generate
     }
   }
 
+  // Debug: Log request summary
+  const imagePartsCount = messages.reduce((count: number, msg: any) => {
+    if (Array.isArray(msg.content)) {
+      return count + msg.content.filter((p: any) => p.type === 'image_url').length;
+    }
+    return count;
+  }, 0);
+  const totalTextLength = messages.reduce((len: number, msg: any) => {
+    if (typeof msg.content === 'string') return len + msg.content.length;
+    if (Array.isArray(msg.content)) {
+      return len + msg.content.filter((p: any) => p.type === 'text').reduce((l: number, p: any) => l + (p.text?.length || 0), 0);
+    }
+    return len;
+  }, 0);
+  console.log(`[Qwen] Request: ${messages.length} messages, ${imagePartsCount} images, ~${totalTextLength} chars text`);
+  console.log(`[Qwen] Options:`, requestBody.options);
+
   const response = await fetch(`${baseUrl}/chat/completions`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'Authorization': 'Bearer EMPTY' // vLLM doesn't require auth
+      'Authorization': 'Bearer ollama' // Ollama accepts any auth or none
     },
     body: JSON.stringify(requestBody)
   });
@@ -303,7 +420,7 @@ export async function generateImageWithComfyUI(
 }
 
 /**
- * Health check for local vLLM server
+ * Health check for local Ollama server
  */
 export async function checkQwenServerHealth(): Promise<boolean> {
   const { baseUrl } = currentConfig;
@@ -311,7 +428,7 @@ export async function checkQwenServerHealth(): Promise<boolean> {
   try {
     const response = await fetch(`${baseUrl}/models`, {
       method: 'GET',
-      headers: { 'Authorization': 'Bearer EMPTY' }
+      headers: { 'Authorization': 'Bearer ollama' }
     });
     return response.ok;
   } catch {

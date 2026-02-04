@@ -2,7 +2,7 @@
 
 **Target Hardware:** NVIDIA RTX 3090 Ti (24GB VRAM)
 **Goal:** Replace Google Gemini with local Qwen2.5-VL for layout analysis
-**Status:** Planning Phase
+**Status:** Phase 2 Complete ✅
 
 ---
 
@@ -11,215 +11,86 @@
 With 24GB VRAM, you can comfortably run **Qwen2.5-VL-7B-Instruct** (best quality/speed balance) or even **Qwen2.5-VL-32B** with INT4 quantization. This plan covers the complete integration of local Qwen inference for the DesignAnalyst node.
 
 ### Scope
-- ✅ **Layout Analysis** via vLLM + Qwen2.5-VL (core feature)
+- ✅ **Layout Analysis** via Ollama + Qwen2.5-VL (core feature)
 - ⏸️ **Draft Generation** - Disabled for now (nice-to-have, can add later with ComfyUI)
 
----
-
-## Phase 1: Infrastructure Setup
-
-### Task 1.1: WSL2 Environment Setup
-**Priority:** High | **Estimated Time:** 30 mins
-
-- [ ] Verify WSL2 is installed and running Ubuntu
-  ```powershell
-  # PowerShell (Admin)
-  wsl --list --verbose
-  # Should show Ubuntu with VERSION 2
-  ```
-
-- [ ] If not installed:
-  ```powershell
-  wsl --install -d Ubuntu-22.04
-  wsl --set-default-version 2
-  # Reboot Windows
-  ```
-
-- [ ] Verify GPU passthrough works in WSL:
-  ```bash
-  # Inside WSL
-  nvidia-smi
-  # Should show your 3090 Ti
-  ```
-
-### Task 1.2: CUDA Toolkit in WSL
-**Priority:** High | **Estimated Time:** 20 mins
-
-- [ ] Install CUDA toolkit for WSL:
-  ```bash
-  # Inside WSL Ubuntu
-  sudo apt update && sudo apt upgrade -y
-  sudo apt install -y build-essential python3-dev python3-venv python3-pip git
-
-  # Install CUDA for WSL
-  wget https://developer.download.nvidia.com/compute/cuda/repos/wsl-ubuntu/x86_64/cuda-keyring_1.1-1_all.deb
-  sudo dpkg -i cuda-keyring_1.1-1_all.deb
-  sudo apt update
-  sudo apt install -y cuda-toolkit-12-6
-
-  # Add to PATH
-  echo 'export PATH="/usr/local/cuda-12.6/bin:$PATH"' >> ~/.bashrc
-  echo 'export LD_LIBRARY_PATH="/usr/local/cuda-12.6/lib64:$LD_LIBRARY_PATH"' >> ~/.bashrc
-  source ~/.bashrc
-  ```
-
-- [ ] Verify CUDA:
-  ```bash
-  nvcc --version
-  # Should show CUDA 12.6
-  ```
-
-### Task 1.3: vLLM Installation
-**Priority:** High | **Estimated Time:** 15 mins
-
-- [ ] Create Python virtual environment:
-  ```bash
-  python3 -m venv ~/vllm-env
-  source ~/vllm-env/bin/activate
-  pip install --upgrade pip wheel setuptools
-  ```
-
-- [ ] Install vLLM (requires v0.11.0+ for Qwen2.5-VL support):
-  ```bash
-  pip install "vllm>=0.11.0"
-  # This will take a few minutes
-  ```
-
-- [ ] Install additional dependencies for vision models:
-  ```bash
-  pip install qwen-vl-utils pillow
-  ```
-
-### Task 1.4: Configure Custom Model Directory
-**Priority:** High | **Estimated Time:** 5 mins
-
-Your models will be stored at:
-- **Windows Path:** `E:\RANDOM_STUFF\VIBE\PSD_PROCEDURAL_GENERATOR\MODELS`
-- **WSL Path:** `/mnt/e/RANDOM_STUFF/VIBE/PSD_PROCEDURAL_GENERATOR/MODELS`
-
-Current contents:
-- `qwen_image_edit_2511_fp8mixed.safetensors` (ComfyUI - already present)
-- `Qwen2.5-VL-7B-Instruct/` (will be downloaded here)
-
-- [ ] Add HuggingFace cache redirect to `~/.bashrc`:
-  ```bash
-  echo 'export HF_HOME="/mnt/e/RANDOM_STUFF/VIBE/PSD_PROCEDURAL_GENERATOR/MODELS/huggingface"' >> ~/.bashrc
-  echo 'export TRANSFORMERS_CACHE="/mnt/e/RANDOM_STUFF/VIBE/PSD_PROCEDURAL_GENERATOR/MODELS/huggingface"' >> ~/.bashrc
-  source ~/.bashrc
-  ```
-
-- [ ] Create the directory structure:
-  ```bash
-  mkdir -p /mnt/e/RANDOM_STUFF/VIBE/PSD_PROCEDURAL_GENERATOR/MODELS/huggingface
-  ```
-
-### Task 1.5: Download and Test Model
-**Priority:** High | **Estimated Time:** 20 mins (depends on internet)
-
-- [ ] Download the model to your custom location (~15GB):
-  ```bash
-  source ~/vllm-env/bin/activate
-
-  # Verify HF_HOME is set correctly
-  echo $HF_HOME
-  # Should show: /mnt/e/RANDOM_STUFF/VIBE/PSD_PROCEDURAL_GENERATOR/MODELS/huggingface
-
-  # Test download and inference
-  python -c "
-  from vllm import LLM
-  llm = LLM(model='Qwen/Qwen2.5-VL-7B-Instruct', trust_remote_code=True)
-  print('Model loaded successfully!')
-  "
-  ```
-
-- [ ] Verify model downloaded to correct location:
-  ```bash
-  ls -la /mnt/e/RANDOM_STUFF/VIBE/PSD_PROCEDURAL_GENERATOR/MODELS/huggingface/hub/
-  # Should show: models--Qwen--Qwen2.5-VL-7B-Instruct
-  ```
-
-- [ ] Create startup script (`~/start-qwen-server.sh`):
-  ```bash
-  #!/bin/bash
-  source ~/vllm-env/bin/activate
-
-  # Ensure custom model path is used
-  export HF_HOME="/mnt/e/RANDOM_STUFF/VIBE/PSD_PROCEDURAL_GENERATOR/MODELS/huggingface"
-  export TRANSFORMERS_CACHE="$HF_HOME"
-
-  vllm serve Qwen/Qwen2.5-VL-7B-Instruct \
-    --host 0.0.0.0 \
-    --port 8000 \
-    --gpu-memory-utilization 0.85 \
-    --max-model-len 8192 \
-    --trust-remote-code \
-    --dtype bfloat16 \
-    --limit-mm-per-prompt image=10
-  ```
-
-- [ ] Make executable:
-  ```bash
-  chmod +x ~/start-qwen-server.sh
-  ```
-
-### Task 1.6: Verify Server
-**Priority:** High | **Estimated Time:** 5 mins
-
-- [ ] Start the server:
-  ```bash
-  ~/start-qwen-server.sh
-  ```
-
-- [ ] Test from Windows (new terminal):
-  ```powershell
-  # Test endpoint
-  curl http://localhost:8000/v1/models
-
-  # Should return JSON with model info
-  ```
-
-- [ ] Test multimodal inference:
-  ```bash
-  curl http://localhost:8000/v1/chat/completions \
-    -H "Content-Type: application/json" \
-    -d '{
-      "model": "Qwen/Qwen2.5-VL-7B-Instruct",
-      "messages": [{"role": "user", "content": "Hello, describe what you can do"}],
-      "max_tokens": 100
-    }'
-  ```
+### Infrastructure Decision
+> **Note:** Originally planned for vLLM on WSL2, but due to FlashAttention segfaults with vision-language models on WSL, we pivoted to **Ollama on native Windows**. This provides a more stable experience with the same OpenAI-compatible API.
 
 ---
 
-## Phase 2: Application Integration
+## Phase 1: Infrastructure Setup ✅ COMPLETE
+
+> **Implementation Note:** Originally planned for vLLM on WSL2, but FlashAttention causes segfaults with vision-language models on WSL. Pivoted to Ollama on native Windows.
+
+### Task 1.1: Install Ollama on Windows ✅
+- [x] Download and install Ollama from https://ollama.com/download/windows
+- [x] Ollama runs as a Windows service (auto-starts)
+
+### Task 1.2: Pull Qwen2.5-VL Model ✅
+```powershell
+ollama pull qwen2.5vl:7b
+```
+- [x] Model downloaded (~4.7GB quantized GGUF format)
+- [x] Stored in `%USERPROFILE%\.ollama\models`
+
+### Task 1.3: Verify Server ✅
+```powershell
+# Test model works
+ollama run qwen2.5vl:7b "Hello, can you see images?"
+
+# Test API endpoint
+curl http://localhost:11434/v1/models
+```
+- [x] Server responds with model list
+- [x] Model responds to prompts
+
+### Server Details
+| Setting | Value |
+|---------|-------|
+| API Base URL | `http://localhost:11434/v1` |
+| Model Name | `qwen2.5vl:7b` |
+| API Key | Not required (use empty string or "ollama") |
+| Format | OpenAI-compatible |
+
+### Cleanup (Optional)
+The WSL vLLM setup is no longer needed. To reclaim disk space:
+```bash
+# In WSL Ubuntu
+rm -rf ~/qwen-vllm  # ~15GB HuggingFace model + venv
+```
+
+---
+
+## Phase 2: Application Integration ✅ COMPLETE
 
 ### Task 2.1: Environment Configuration
-**Priority:** High | **Estimated Time:** 5 mins
+**Priority:** High | **Estimated Time:** 5 mins | **STATUS: COMPLETE ✅**
 
-- [ ] Update `.env.local`:
+- [x] Update `.env.local` for Ollama:
   ```bash
   # Switch to local Qwen
   VITE_AI_PROVIDER=qwen-local
 
-  # vLLM server endpoint
-  VITE_QWEN_BASE_URL=http://localhost:8000/v1
-  VITE_QWEN_MODEL=Qwen/Qwen2.5-VL-7B-Instruct
+  # Ollama server endpoint (NOT vLLM)
+  VITE_QWEN_BASE_URL=http://localhost:11434/v1
+  VITE_QWEN_MODEL=qwen2.5vl:7b
 
   # Keep Gemini key as fallback
   VITE_API_KEY=your-existing-gemini-key
 
-  # ComfyUI for image generation
+  # ComfyUI for image generation (optional)
   VITE_COMFYUI_URL=http://127.0.0.1:8188
   ```
 
 ### Task 2.2: Verify aiProviderService.ts Exists
-**Priority:** High | **Estimated Time:** 2 mins
+**Priority:** High | **Estimated Time:** 2 mins | **STATUS: COMPLETE**
 
-- [ ] Confirm file exists at `services/aiProviderService.ts`
-- [ ] If not, it needs to be created (see Phase 3)
+- [x] Confirm file exists at `services/aiProviderService.ts`
+- [x] If not, it needs to be created (see Phase 3)
 
 ### Task 2.2.1: Critical - vLLM API Format Requirements
-**Priority:** High | **Must understand before implementation**
+**Priority:** High | **Must understand before implementation** | **STATUS: COMPLETE (implemented in aiProviderService.ts)**
 
 > **IMPORTANT:** vLLM's OpenAI-compatible API has specific format requirements that differ from how the code abstracts them. The `aiProviderService.ts` must handle these translations internally.
 
@@ -295,7 +166,7 @@ function parseJsonResponse(content: string): any {
 ---
 
 ### Task 2.3: Modify DesignAnalystNode.tsx
-**Priority:** High | **Estimated Time:** 45 mins
+**Priority:** High | **Estimated Time:** 45 mins | **STATUS: COMPLETE ✅**
 
 #### Step A: Update Imports (Line ~10)
 
@@ -318,7 +189,7 @@ import {
 
 #### Step B: Add Health Check Indicator
 
-- [ ] Add state for server status:
+- [x] Add state for server status:
   ```typescript
   const [serverStatus, setServerStatus] = useState<'checking' | 'online' | 'offline'>('checking');
 
@@ -656,12 +527,12 @@ const generateDraft = async (prompt: string, sourceReference?: string): Promise<
 ### Task 4.1: Unit Test - Server Connection
 **Priority:** High | **Estimated Time:** 5 mins
 
-- [ ] Start vLLM server
+- [ ] Verify Ollama is running (it auto-starts as a Windows service)
 - [ ] Start dev server: `npm run dev`
 - [ ] Open browser console
 - [ ] Run:
   ```javascript
-  fetch('http://localhost:8000/v1/models')
+  fetch('http://localhost:11434/v1/models')
     .then(r => r.json())
     .then(console.log)
   ```
@@ -731,29 +602,28 @@ vllm serve Qwen/Qwen2.5-VL-32B-Instruct-AWQ \
 
 ### Start Everything (Run in order)
 
-```bash
-# Terminal 1: vLLM Server (WSL)
-~/start-qwen-server.sh
+```powershell
+# Ollama runs automatically as a Windows service - no action needed!
 
-# Terminal 2: ComfyUI (Windows CMD)
+# Terminal 1: ComfyUI (Windows CMD) - Optional, only for draft generation
 cd C:\path\to\ComfyUI
 python main.py --listen
 
-# Terminal 3: Dev Server (Windows CMD)
+# Terminal 2: Dev Server (Windows CMD)
 cd E:\RANDOM_STUFF\VIBE\PSD_PROCEDURAL_GENERATOR\PSD_Procedural_Generator
 npm run dev
 ```
 
 ### Health Checks
 
-```bash
-# vLLM
-curl http://localhost:8000/v1/models
+```powershell
+# Ollama
+curl http://localhost:11434/v1/models
 
-# ComfyUI
+# ComfyUI (optional)
 curl http://127.0.0.1:8188/system_stats
 
-# Both should return JSON
+# Should return JSON
 ```
 
 ### Switch Providers
@@ -761,7 +631,7 @@ curl http://127.0.0.1:8188/system_stats
 ```bash
 # In .env.local:
 
-# Use local Qwen
+# Use local Qwen (Ollama)
 VITE_AI_PROVIDER=qwen-local
 
 # Use cloud Gemini
@@ -774,51 +644,69 @@ VITE_AI_PROVIDER=gemini
 
 | Issue | Solution |
 |-------|----------|
-| `CUDA out of memory` | Reduce `--gpu-memory-utilization` to 0.80 or use 3B model |
-| `Connection refused` | Ensure vLLM server is running and WSL firewall allows port 8000 |
+| `Connection refused` on 11434 | Restart Ollama service: `ollama serve` in terminal, or restart Windows |
+| `CUDA out of memory` | Ollama auto-manages VRAM, but try stopping other GPU apps |
 | `JSON parse error` | Qwen may wrap JSON in markdown - aiProviderService handles this |
-| `Slow inference` | Reduce `--max-model-len` to 4096, check for CPU offloading |
+| `Slow inference` | Normal for 7B model. First request loads model (~10-20s), subsequent are faster |
+| `Model not found` | Run `ollama list` to verify model name, re-pull if needed |
 | `ComfyUI timeout` | Increase timeout in aiProviderService or check workflow |
+| `model runner has unexpectedly stopped` with qwen2.5vl | **Known Issue**: qwen2.5vl crashes during vision inference due to OOM. Switch to `minicpm-v:8b` which is more stable for vision tasks |
+
+### Critical Issue: qwen2.5vl Vision Crashes
+
+**Problem**: When sending images to qwen2.5vl:7b, Ollama returns error 500 with "model runner has unexpectedly stopped". This occurs even with small images.
+
+**Root Cause**: qwen2.5vl tokenizes images into many tokens, requiring significant additional VRAM beyond the base model load (~14GB). During image inference, the model attempts to allocate more memory than available, causing OOM crashes ([GitHub Issue #10753](https://github.com/ollama/ollama/issues/10753)).
+
+**Solution**: Use **minicpm-v:8b** instead, which handles vision tasks more efficiently:
+```powershell
+ollama pull minicpm-v:8b
+```
+
+Update `.env.local`:
+```bash
+VITE_QWEN_MODEL=minicpm-v:8b
+```
 
 ---
 
 ## Hardware Utilization (3090 Ti 24GB)
 
-| Configuration | VRAM Usage | Performance |
-|---------------|------------|-------------|
-| Qwen2.5-VL-7B BF16 | ~16GB | Best quality |
-| Qwen2.5-VL-7B + ComfyUI | ~20GB | Both running |
-| Qwen2.5-VL-32B AWQ | ~22GB | Higher quality, slower |
-| Qwen2.5-VL-3B BF16 | ~8GB | Fastest, lower quality |
+| Configuration | VRAM Usage | Performance | Vision Stability |
+|---------------|------------|-------------|------------------|
+| minicpm-v:8b | ~6GB | Good balance | **Stable** ✅ |
+| Qwen2.5-VL-7B | ~14GB base | Higher quality | **Crashes with images** ❌ |
+| Qwen2.5-VL-32B AWQ | ~22GB | Highest quality | Untested |
+| Qwen2.5-VL-3B BF16 | ~8GB | Fastest | May have same issues |
 
-**Recommended:** Qwen2.5-VL-7B with BF16 leaves ~8GB for ComfyUI operations.
+**Recommended:** `minicpm-v:8b` - stable vision model that works reliably with images and leaves ~18GB for ComfyUI operations.
 
 ---
 
 ## Completion Checklist
 
-- [ ] Phase 1: Infrastructure Setup
-  - [ ] WSL2 configured
-  - [ ] CUDA toolkit installed
-  - [ ] vLLM installed
-  - [ ] Custom model directory configured
-  - [ ] Model downloaded to E:\...\MODELS
-  - [ ] Server verified
+- [x] Phase 1: Infrastructure Setup ✅
+  - [x] Ollama installed on Windows
+  - [x] Vision model pulled (switched from `qwen2.5vl:7b` to `minicpm-v:8b` due to vision crashes)
+  - [x] Server verified at `http://localhost:11434/v1`
+  - ~~WSL2/vLLM approach abandoned due to FlashAttention segfaults~~
+  - ~~qwen2.5vl:7b abandoned due to OOM crashes with images~~
 
-- [ ] Phase 2: Application Integration
-  - [ ] .env.local configured (VITE_AI_PROVIDER=qwen-local)
-  - [ ] aiProviderService.ts present
-  - [ ] aiProviderService.ts handles vLLM API format (system prompt as message, response_format.json_schema)
-  - [ ] aiProviderService.ts strips markdown code fences from JSON responses
-  - [ ] DesignAnalystNode.tsx modified
-  - [ ] Imports updated
-  - [ ] performAnalysis updated
-  - [ ] generateDraft disabled/simplified
+- [x] Phase 2: Application Integration ✅ COMPLETE
+  - [x] .env.local updated for Ollama endpoint (port 11434, model minicpm-v:8b)
+  - [x] aiProviderService.ts present
+  - [x] aiProviderService.ts updated for Ollama endpoint (port 11434, model name)
+  - [x] aiProviderService.ts handles Ollama API format (system prompt as message, response_format.json_object)
+  - [x] aiProviderService.ts strips markdown code fences from JSON responses
+  - [x] DesignAnalystNode.tsx modified
+  - [x] Imports updated
+  - [x] performAnalysis updated
+  - [x] generateDraft disabled/simplified
 
 - [ ] ~~Phase 3: ComfyUI Integration~~ (DEFERRED)
 
 - [ ] Phase 4: Testing
-  - [ ] Server connection works
+  - [ ] Server connection works from app
   - [ ] Analysis returns valid JSON
   - [ ] Layout transforms correctly
   - [ ] Performance acceptable
@@ -846,10 +734,11 @@ This keeps all your AI models organized in one location on your E: drive.
 
 ---
 
-**Document Version:** 1.2
-**Last Updated:** 2026-02-03
+**Document Version:** 1.3
+**Last Updated:** 2026-02-04
 **Author:** Claude Code
 
 ### Changelog
+- **v1.3** - **Major pivot**: Replaced vLLM/WSL with Ollama on Windows due to FlashAttention segfaults. Updated all endpoints from :8000 to :11434, model name to `qwen2.5vl:7b`. Phase 1 now complete.
 - **v1.2** - Added vLLM version requirement (>=0.11.0), multimodal limit flag, and critical API format documentation for structured outputs and system prompts
 - **v1.1** - Initial plan with deferred ComfyUI integration

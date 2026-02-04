@@ -11,7 +11,7 @@ npm run build    # Production build
 npm run preview  # Preview production build
 ```
 
-**Required:** Set `GEMINI_API_KEY` in `.env.local` for AI features.
+**Required:** Configure AI provider in `.env.local` (see AI Integration section below).
 
 ## Architecture Overview
 
@@ -51,6 +51,15 @@ LoadPSD → DesignInfo/TemplateSplitter → ContainerResolver → DesignAnalyst 
 
 **SmartObjectRegistry** ([services/smartObjectRegistry.ts](services/smartObjectRegistry.ts)) - Module-scope singleton storing heavy `linkedFiles` binaries separately from React state.
 
+**AI Provider Service** ([services/aiProviderService.ts](services/aiProviderService.ts)) - Provider-agnostic AI abstraction:
+- `generateCompletion()`: Unified interface for text/vision inference with structured JSON output
+- Supports Gemini (cloud) and Ollama (local) backends via `VITE_AI_PROVIDER` env var
+- Automatic image downscaling for local models (max 512px, aligned to 28px patch size)
+- Extended context window for Ollama (`num_ctx: 16384`) to handle complex prompts
+- JSON response parsing with markdown code fence stripping
+- Health checks for local servers via `checkQwenServerHealth()`
+- Debug logging for Qwen requests (model, image count, text length)
+
 ### Node Connection Validation
 
 [App.tsx](App.tsx) contains comprehensive `onConnect` validation logic that enforces type-safe connections between nodes. Key rules:
@@ -73,7 +82,47 @@ PSD files use a `!!TEMPLATE` top-level group containing container definitions. C
 
 ### AI Integration
 
-Uses Google Gemini API (`@google/genai`) for:
+**AI Provider Service** ([services/aiProviderService.ts](services/aiProviderService.ts)) - Abstraction layer supporting multiple AI backends:
+- `gemini`: Google Gemini API (cloud) - default
+- `qwen-local`: Ollama with local vision-language models (e.g., `minicpm-v:8b`)
+
+#### Environment Configuration (`.env.local`)
+
+```bash
+# Provider selection: 'gemini' (cloud) or 'qwen-local' (Ollama)
+VITE_AI_PROVIDER=gemini
+
+# Gemini (cloud) - required if using gemini provider
+VITE_API_KEY=your-gemini-api-key
+
+# Qwen Local (Ollama) - required if using qwen-local provider
+VITE_QWEN_BASE_URL=http://localhost:11434/v1
+VITE_QWEN_MODEL=qwen2.5vl:7b  # or minicpm-v:8b for stability
+
+# ComfyUI (optional, for draft generation - currently disabled)
+VITE_COMFYUI_URL=http://127.0.0.1:8188
+```
+
+#### Local Ollama Setup
+
+To use local inference instead of cloud Gemini:
+
+1. Install Ollama from https://ollama.com/download/windows
+2. Pull a vision model: `ollama pull qwen2.5vl:7b` (requires ~17GB VRAM)
+3. Set `VITE_AI_PROVIDER=qwen-local` in `.env.local`
+
+**Model Options:**
+- `qwen2.5vl:7b`: Superior reasoning for complex layouts, but has known GGML tensor errors with certain image dimensions
+- `minicpm-v:8b`: More stable alternative if qwen2.5vl crashes
+
+**Known Issues with qwen2.5vl:7b:**
+- GGML assertion errors (`a->ne[2] * 4 == b->ne[0]`) on some image dimensions
+- Workaround: Images are auto-aligned to 28px patch size boundaries
+- If crashes persist, switch to `minicpm-v:8b`
+
+#### AI Features
+
+Used for:
 - Layout analysis and strategy generation in DesignAnalyst
 - Design review and refinement in DesignReviewer
 - Generative fill proposals (when `generationAllowed` flag is true)
@@ -124,14 +173,20 @@ Layout strategies include confidence triangulation (`TriangulationAudit`) with v
 - Registers resolved contexts with layers and bounds to `resolvedRegistry`
 
 **DesignAnalystNode** ([components/DesignAnalystNode.tsx](components/DesignAnalystNode.tsx)) - AI-powered layout strategist:
-- Uses Google Gemini API for "Knowledge-Anchored Semantic Recomposition"
+- Uses `aiProviderService` for "Knowledge-Anchored Semantic Recomposition" (supports Gemini or local Ollama)
+- Server health indicator for local Ollama connections (checking/online/offline)
 - Multi-instance support for parallel container analysis
 - Model selection: Flash (fast), Pro (balanced), Deep Thinking (thorough)
 - Generates `LayoutStrategy` with: method (GEOMETRIC/GENERATIVE/HYBRID), spatial layout, scale, overrides
 - Confidence triangulation via visual, knowledge, and metadata vectors
 - Knowledge integration: scopes rules per container, respects mute toggle
 - Extracts semantic anchors for content preservation
-- Generates preview drafts for generative methods
+- Draft generation disabled by default (ComfyUI integration deferred)
+- **Token optimization for local models:**
+  - Depth-limited layer flattening (`maxDepth=3`) prevents token explosion on nested containers
+  - Layer sample capped at 20 to reduce prompt size
+  - Image detail set to 'low' for vision tokens
+- **Persistence optimization:** `sourceReference` (base64 image) stripped from stored state to prevent project file bloat
 
 **RemapperNode** ([components/RemapperNode.tsx](components/RemapperNode.tsx)) - Transformation engine:
 - Applies geometric transforms from source to target bounds
@@ -206,3 +261,27 @@ Layout strategies include confidence triangulation (`TriangulationAudit`) with v
   - Creates full pipeline: Splitters → Resolver → Analyst → Remapper → Reviewer → Preview → Export
 - **Save/Load**: JSON export/import of project state (nodes, edges, viewport)
 - **Reset**: Two-step destructive reset (confirmation required) - clears all data but preserves node layout
+
+### Troubleshooting
+
+#### Local Ollama Issues
+
+**"GGML_ASSERT failed" errors with qwen2.5vl:**
+- This is a known bug in Ollama's GGML implementation for Qwen2.5-VL
+- Images are auto-resized to 28px-aligned dimensions, but some combinations still fail
+- Workaround: Use `minicpm-v:8b` instead: `VITE_QWEN_MODEL=minicpm-v:8b`
+
+**Model crashes with nested layer containers:**
+- Depth-limited flattening is applied (`maxDepth=3`)
+- If still crashing, the container may have too many layers for the context window
+- Check browser console for `[Qwen]` debug logs showing request size
+
+**Large project file sizes after analysis:**
+- Fixed: `sourceReference` base64 data is now stripped from persisted state
+- If old projects are bloated, re-run analysis to update stored strategies
+
+**Ollama server debugging:**
+```powershell
+$env:OLLAMA_DEBUG="1"; ollama serve
+```
+This enables verbose server-side logging to diagnose crashes.

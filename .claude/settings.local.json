@@ -47,7 +47,20 @@
       "Bash(claude mcp add:*)",
       "Bash(claude mcp get:*)",
       "mcp__context7__resolve-library-id",
-      "mcp__context7__query-docs"
+      "mcp__context7__query-docs",
+      "Bash(wsl --list --verbose:*)",
+      "Bash(wsl --list:*)",
+      "Bash(claude mcp:*)",
+      "Bash(wsl -e bash -c \"nvidia-smi 2>&1 || echo ''nvidia-smi not found''\")",
+      "Bash(wsl -e bash -c \"nvcc --version 2>&1 || echo ''CUDA toolkit not installed yet''\")",
+      "Bash(wsl -e bash -c:*)",
+      "Bash(wsl -e bash -lc \"nvcc --version 2>&1 || /usr/local/cuda/bin/nvcc --version 2>&1 || ls /usr/local/cuda*/bin/nvcc 2>&1\")",
+      "Bash(wsl -e bash -lc \"source ~/qwen-vllm/venv/bin/activate && python -c \"\"import vllm; print\\(''vLLM version:'', vllm.__version__\\)\"\"\")",
+      "Bash(where:*)",
+      "Bash(ollama ps:*)",
+      "WebFetch(domain:github.com)",
+      "Bash(ollama pull:*)",
+      "Bash(ollama list:*)"
     ]
   }
 }

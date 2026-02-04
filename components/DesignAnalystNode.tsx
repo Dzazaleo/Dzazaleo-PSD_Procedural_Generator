@@ -7,7 +7,14 @@ import { PSDNodeData, LayoutStrategy, SerializableLayer, ChatMessage, AnalystIns
 import { useProceduralStore } from '../store/ProceduralContext';
 import { getSemanticThemeObject, findLayerByPath, calculateGroupBounds } from '../services/psdService';
 import { useKnowledgeScoper } from '../hooks/useKnowledgeScoper';
-import { GoogleGenAI, Type } from "@google/genai";
+import {
+  generateCompletion,
+  generateImageWithComfyUI,
+  getAIProviderConfig,
+  checkQwenServerHealth,
+  ContentPart,
+  StructuredOutputSchema
+} from '../services/aiProviderService';
 import { Brain, BrainCircuit, Ban, ClipboardList, AlertCircle, RefreshCw, RotateCcw, Play, Eye, BookOpen, Tag, Activity, Expand, Minimize2, MapPin, Scaling } from 'lucide-react';
 import { Psd } from 'ag-psd';
 
@@ -91,7 +98,7 @@ const StrategyCard: React.FC<{ strategy: LayoutStrategy, modelConfig: ModelConfi
                     <span className={`text-[9px] px-1.5 py-0.5 rounded border font-mono font-bold tracking-wider flex items-center gap-1 ${spatialClass}`}>
                         {spatialIcon} {spatialLabel}
                     </span>
-                    <span className="text-slate-400 text-[10px]">{strategy.anchor}</span>
+                    <span className="text-slate-400 text-[10px]">{strategy.anchor || 'CENTER'}</span>
                 </div>
              </div>
 
@@ -207,7 +214,7 @@ const StrategyCard: React.FC<{ strategy: LayoutStrategy, modelConfig: ModelConfi
              <div className="grid grid-cols-2 gap-4 mt-1">
                 <div>
                     <span className="block text-slate-500 text-[10px] uppercase tracking-wider">Global Scale</span>
-                    <span className="text-slate-200 font-mono text-sm">{strategy.suggestedScale.toFixed(3)}x</span>
+                    <span className="text-slate-200 font-mono text-sm">{(strategy.suggestedScale ?? 1).toFixed(3)}x</span>
                 </div>
                 <div>
                     <span className="block text-slate-500 text-[10px] uppercase tracking-wider">Overrides</span>
@@ -443,12 +450,13 @@ const InstanceRow: React.FC<any> = ({
 
 export const DesignAnalystNode = memo(({ id, data }: NodeProps<PSDNodeData>) => {
   const [analyzingInstances, setAnalyzingInstances] = useState<Record<number, boolean>>({});
+  const [serverStatus, setServerStatus] = useState<'checking' | 'online' | 'offline'>('checking');
   const instanceCount = data.instanceCount || 1;
   const activeInstances = data.activeInstances;
   const analystInstances = data.analystInstances || {};
   const draftTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const edges = useEdges();
-  const nodes = useNodes(); 
+  const nodes = useNodes();
   const { setNodes } = useReactFlow();
   const updateNodeInternals = useUpdateNodeInternals();
   const { resolvedRegistry, templateRegistry, knowledgeRegistry, registerResolved, registerTemplate, unregisterNode, psdRegistry, flushPipelineInstance } = useProceduralStore();
@@ -458,10 +466,26 @@ export const DesignAnalystNode = memo(({ id, data }: NodeProps<PSDNodeData>) => 
   }, [edges, id]);
 
   const effectiveIndices = useMemo(() => {
-     return activeInstances && activeInstances.length > 0 
-       ? activeInstances 
+     return activeInstances && activeInstances.length > 0
+       ? activeInstances
        : Array.from({ length: instanceCount }, (_, i) => i);
   }, [instanceCount, activeInstances]);
+
+  // Server health check for local Qwen
+  useEffect(() => {
+    const checkServer = async () => {
+      const config = getAIProviderConfig();
+      if (config.provider === 'qwen-local') {
+        const healthy = await checkQwenServerHealth();
+        setServerStatus(healthy ? 'online' : 'offline');
+      } else {
+        setServerStatus('online'); // Gemini assumed online
+      }
+    };
+    checkServer();
+    const interval = setInterval(checkServer, 30000); // Check every 30s
+    return () => clearInterval(interval);
+  }, []);
 
   useEffect(() => {
     return () => unregisterNode(id);
@@ -667,21 +691,41 @@ export const DesignAnalystNode = memo(({ id, data }: NodeProps<PSDNodeData>) => 
   };
 
   const generateDraft = async (prompt: string, sourceReference?: string): Promise<string | null> => {
+     const config = getAIProviderConfig();
+
+     // Use ComfyUI for local image generation (if available)
+     if (config.provider === 'qwen-local') {
+         const sourceUrl = sourceReference
+             ? `data:image/png;base64,${sourceReference}`
+             : undefined;
+         return generateImageWithComfyUI(prompt, sourceUrl, {
+             width: 256,
+             height: 256,
+             steps: 20
+         });
+     }
+
+     // Fallback: Gemini image generation for cloud provider
      try {
-         const apiKey = process.env.API_KEY;
+         const apiKey = import.meta.env.VITE_API_KEY;
          if (!apiKey) return null;
+
+         const { GoogleGenAI } = await import('@google/genai');
          const ai = new GoogleGenAI({ apiKey });
          const parts: any[] = [];
+
          if (sourceReference) {
              const base64Data = sourceReference.includes('base64,') ? sourceReference.split('base64,')[1] : sourceReference;
              parts.push({ inlineData: { mimeType: 'image/png', data: base64Data } });
          }
          parts.push({ text: `Generate a draft sketch (256x256) for: ${prompt}` });
+
          const response = await ai.models.generateContent({
              model: 'gemini-2.5-flash-image',
              contents: { parts },
              config: { imageConfig: { aspectRatio: "1:1" } }
          });
+
          for (const part of response.candidates?.[0]?.content?.parts || []) {
             if (part.inlineData) { return `data:image/png;base64,${part.inlineData.data}`; }
          }
@@ -698,178 +742,146 @@ export const DesignAnalystNode = memo(({ id, data }: NodeProps<PSDNodeData>) => 
     const targetW = targetData.bounds.w;
     const targetH = targetData.bounds.h;
 
-    const flattenLayers = (layers: SerializableLayer[], depth = 0): any[] => {
+    // Depth-limited flattening to prevent token explosion on nested containers
+    // maxDepth=3 allows deeper nesting while avoiding explosion (24GB VRAM has headroom)
+    const flattenLayers = (layers: SerializableLayer[], depth = 0, maxDepth = 3): any[] => {
+        if (depth > maxDepth) return [];
+
         let flat: any[] = [];
         layers.forEach(l => {
-            let effectiveCoords = l.coords;
-            
-            // DEEP BOUND RESOLUTION FOR GROUPS
-            // If it's a group, we ignore its reported bounds and recalculate 
-            // the union of its visible content to prevent false positives.
-            // This ensures the "Lawyer" (AI) sees the true visual footprint.
-            if (l.type === 'group' && l.children && l.children.length > 0) {
-                const tightBounds = calculateGroupBounds(l.children);
-                // Only override if we found valid content (width > 0) to avoid flagging empty groups
-                if (tightBounds.w > 0 && tightBounds.h > 0) {
-                     effectiveCoords = tightBounds;
+            // Only include actual content layers + top-level groups (skip deep nested groups)
+            if (l.type === 'layer' || depth <= 1) {
+                let effectiveCoords = l.coords;
+
+                if (l.type === 'group' && l.children && l.children.length > 0) {
+                    const tightBounds = calculateGroupBounds(l.children);
+                    if (tightBounds.w > 0 && tightBounds.h > 0) {
+                         effectiveCoords = tightBounds;
+                    }
                 }
+
+                flat.push({
+                    id: l.id,
+                    name: l.name,
+                    type: l.type,
+                    depth: depth,
+                    relX: (effectiveCoords.x - sourceData.container.bounds.x) / sourceW,
+                    relY: (effectiveCoords.y - sourceData.container.bounds.y) / sourceH,
+                    width: effectiveCoords.w,
+                    height: effectiveCoords.h,
+                    childCount: l.children?.length ?? 0
+                });
             }
 
-            flat.push({
-                id: l.id, 
-                name: l.name, 
-                type: l.type, 
-                depth: depth,
-                // Use computed coords relative to source container
-                relX: (effectiveCoords.x - sourceData.container.bounds.x) / sourceW,
-                relY: (effectiveCoords.y - sourceData.container.bounds.y) / sourceH,
-                width: effectiveCoords.w, 
-                height: effectiveCoords.h
-            });
-            if (l.children) { flat = flat.concat(flattenLayers(l.children, depth + 1)); }
+            if (l.children && depth < maxDepth) {
+                flat = flat.concat(flattenLayers(l.children, depth + 1, maxDepth));
+            }
         });
         return flat;
     };
 
     const layerAnalysisData = flattenLayers(sourceData.layers as SerializableLayer[]);
 
-    // --- ASPECT RATIO ANALYSIS ---
     const sourceRatio = sourceW / sourceH;
     const targetRatio = targetW / targetH;
-    const isMismatch = Math.abs(sourceRatio - targetRatio) > 0.15; // 15% tolerance
-    
-    let transformationNote = "";
-    if (isMismatch) {
-        const getOr = (w: number, h: number) => w > h ? "Landscape" : (h > w ? "Portrait" : "Square");
-        transformationNote = `\n[GEOMETRY SHIFT DETECTED]\nTransformation: ${getOr(sourceW, sourceH)} Source -> ${getOr(targetW, targetH)} Target.\nThe target aspect ratio differs significantly. Do not just scale the image. You must RE-COMPOSE the layout to fit the new geometry naturally.`;
-    }
+    const isMismatch = Math.abs(sourceRatio - targetRatio) > 0.15;
 
-    let prompt = `
-        ROLE: Senior Visual Systems Lead & Layout Engineer.
-        GOAL: Perform "Knowledge-Anchored Semantic Recomposition" with a strict Layout Protocol.
-        
-        CONTAINER CONTEXT:
-        - Source: ${sourceData.container.containerName} (${sourceW}x${sourceH})
-        - Target: ${targetData.name} (${targetW}x${targetH})
-        ${transformationNote}
-        
-        LAYER HIERARCHY (JSON):
-        ${JSON.stringify(layerAnalysisData.slice(0, 100))}
+    const getOrientation = (w: number, h: number) => w > h ? "Landscape" : (h > w ? "Portrait" : "Square");
+    const geometryContext = isMismatch
+        ? `⚠️ GEOMETRY SHIFT: ${getOrientation(sourceW, sourceH)} → ${getOrientation(targetW, targetH)}. You must RECOMPOSE the layout, not just scale it.`
+        : `Geometry stable: similar aspect ratios.`;
 
-        LAYOUT ENGINEER PROTOCOL (SPATIAL STRATEGY):
-        You MUST assign a strict 'spatialLayout' strategy to this container based on visual intent.
-        Choose exactly ONE of the following:
-        
-        1. 'STRETCH_FILL':
-           - Use for: Backgrounds, Textures, Gradients, or Full-Width Hero Headers.
-           - Behavior: The content will be forcefully stretched to cover the entire target container (0,0 to W,H).
-           - Indication: If the source is a "Background" group or contains a large image meant to fill the space.
-        
-        2. 'UNIFIED_FIT':
-           - Use for: Groups, Cards, Product Shots, Text Blocks, or Complex Composites.
-           - Behavior: The content is treated as a single cohesive unit. It is scaled uniformly to fit within the target bounds while maintaining aspect ratio, and then centered.
-           - Indication: This is the DEFAULT for most content to prevent internal drift or distortion.
-        
-        3. 'ABSOLUTE_PIN':
-           - Use for: Floating Badges, Logos, Watermarks, or UI Overlays that must stay at specific coordinates (e.g. Top-Right).
-           - Behavior: No automatic centering. You must provide explicit xOffset/yOffset overrides for positioning.
-           - Indication: Small, isolated elements that are not part of the main flow.
+    // Build knowledge section if rules exist
+    const knowledgeSection = effectiveRules ? `
+═══════════════════════════════════════════════════════════════════════════════
+DESIGN RULES (MANDATORY - THESE OVERRIDE ALL OTHER GUIDANCE)
+═══════════════════════════════════════════════════════════════════════════════
+${effectiveRules}
+═══════════════════════════════════════════════════════════════════════════════
 
-        SEMANTIC ROLE PROTOCOL (THE DETECTIVE):
-        You must classify every layer into one of the following roles based on Visual and Structural Heuristics. 
-        DO NOT wait for explicit instructions; rely on the patterns below:
-        1. FLOW: Repeating elements, groups with similar names (e.g. 'item_1', 'item_2'), or main content bodies. These belong in the Grid.
-        2. STATIC: Unique UI elements anchored to the Top/Bottom 10% of the canvas (e.g. Headers, Footers, Title Text). These ignore the Grid.
-        3. OVERLAY: Elements that are geographically inside or share a center-point with a larger 'anchor' sibling. (e.g. A 'Price' tag on a 'Card'). These MUST attach to their anchor.
-        4. BACKGROUND: Full-bleed textures at the bottom of the stack.
+RULE INTERPRETATION:
+- "LAYOUT_METHOD: GRID_DISTRIBUTION" → Set layoutMode="GRID", distribute elements evenly
+- "SPACING: X px MIN_PADDING" → Ensure X pixels between elements and from edges
+- "SCALING: uniform" → All elements get the same scale factor
+- "HIERARCHICAL_ANCHORING: A over B" → Layer A must be centered on layer B
+- "UI_RESERVES: Lock X to POSITION" → That element is STATIC, pinned to that position
+- "CONSTRAINTS: No-Go Zones" → Elements must not overlap those regions
 
-        AUTO-LINKING PROTOCOL (THE COUPLER):
-        CRITICAL: If you classify a layer as 'overlay', you MUST populate the 'linkedAnchorId' field. An overlay without an anchor is INVALID.
-        - Heuristic: Find the 'anchor' layer (usually a FLOW item) that shares the closest center-point or fully contains the overlay's bounding box.
-        - The 'linkedAnchorId' MUST be the exact 'id' string of that specific parent/sibling layer from the JSON hierarchy.
-        - Do not link to a generic group if a specific sprite is the visual anchor.
+For EACH rule you apply, you MUST cite it in the override's "citedRule" field.
+` : '';
 
-        KNOWLEDGE OVERRIDE PROTOCOL (THE LAWYER):
-        If the [START KNOWLEDGE] block below contains specific rules for a layer, YOU MUST OBEY THE RULE over your detective inference.
-        - If Rule says "Locked to TOP_CENTER" -> Force role: 'static'.
-        - If Rule says "Centered ON [Layer X]" -> Force role: 'overlay' and set 'linkedAnchorId': '[Layer X]'.
-        - If Rule says "Grid Distribution" -> Force involved layers to role: 'flow'.
+    const prompt = `You are a Layout Composition Expert. Your task is to analyze a PSD container and determine the optimal layout strategy for repositioning its content into a new target container.
 
-        LAYOUT & PHYSICS PROTOCOL:
-        - Extract 'LAYOUT_METHOD' from Knowledge (e.g. "GRID_DISTRIBUTION" -> layoutMode: 'DISTRIBUTE_HORIZONTAL' or 'GRID').
-        - Extract 'BOUNDARY_PHYSICS' (e.g. "No Clipping" -> physicsRules.preventClipping: true).
-        - CRITICAL: Do NOT use 'suggestedScale' to calculate positions. 'suggestedScale' applies ONLY to the Width/Height of the element. X/Y coordinates must be derived relative to the Target Bounds.
+═══════════════════════════════════════════════════════════════════════════════
+TASK SUMMARY
+═══════════════════════════════════════════════════════════════════════════════
+Source Container: "${sourceData.container.containerName}" (${sourceW}×${sourceH}px)
+Target Container: "${targetData.name}" (${targetW}×${targetH}px)
+${geometryContext}
 
-        TRIANGULATION PROTOCOL:
-        You are an expert Semantic Auditor. You must triangulate your decision using three vectors before finalizing your strategy:
-        1. Visual: What do you see in the source image? (e.g., "Red Potion Flask")
-        2. Knowledge: Do the active rules mention this object type? (e.g., "Health items must be red and centered")
-        3. Metadata: Does the layer name support this? (e.g., "Layer 'health_01'")
+${knowledgeSection}
+## LAYER DATA (use these exact IDs in overrides) - showing ${Math.min(20, layerAnalysisData.length)} of ${layerAnalysisData.length} layers
+${JSON.stringify(layerAnalysisData.slice(0, 20))}
 
-        Determine a 'confidence_verdict' (HIGH/MEDIUM/LOW) based on how many vectors align:
-        - 3 Vectors = HIGH (Full Semantic Lock)
-        - 2 Vectors = MEDIUM (Likely Match)
-        - 0-1 Vectors = LOW (Geometric Fallback Recommended)
+═══════════════════════════════════════════════════════════════════════════════
+YOUR DECISIONS
+═══════════════════════════════════════════════════════════════════════════════
 
-        SEMANTIC ANCHOR PROTOCOL:
-        Identify 3-5 'semanticAnchors'. These are the non-negotiable visual subjects (e.g., specific objects, lighting conditions, text, logo elements) that define the image's identity. Output as a string array.
+1. SPATIAL LAYOUT (pick ONE):
+   • "UNIFIED_FIT" (default) - Scale all content as one unit, maintain aspect ratio, center it
+   • "STRETCH_FILL" - For backgrounds/textures that should fill the entire container
+   • "ABSOLUTE_PIN" - For UI elements that need exact positioning (requires xOffset/yOffset)
 
-        GENERATIVE PROHIBITION PROTOCOL:
-        Your default and primary method is 'GEOMETRIC'.
-        You are STRICTLY FORBIDDEN from using 'GENERATIVE' or 'HYBRID' methods unless the provided [START KNOWLEDGE] rules explicitly authorize image regeneration or AI synthesis for the specific container: '${targetData.name}'.
-        Authorization is only valid if the rules contain phrases such as 'allow generative fill', 'authorize AI reconstruction', or 'recreate background texture'.
-        If the Knowledge rules are missing, muted, or do not explicitly grant generative permission, you MUST select 'GEOMETRIC' and set 'generativePrompt' to an empty string.
-        You cannot use 'Expert Intuition' to justify the creation of new pixels; only explicit Knowledge directives can unlock generative methods.
-        In your 'reasoning' output, if you select a generative method, you must start the paragraph by citing the specific authorization rule found in the Knowledge Context.
+2. LAYOUT MODE (if rules specify distribution):
+   • "STANDARD" - No special distribution
+   • "GRID" - Distribute elements in a grid pattern
+   • "DISTRIBUTE_HORIZONTAL" - Space elements evenly horizontally
+   • "DISTRIBUTE_VERTICAL" - Space elements evenly vertically
 
-        DIRECTIVE EXTRACTION PROTOCOL:
-        Analyze the Knowledge Rules below for mandatory constraints (keywords: MUST, SHALL, REQUIRED).
-        Map them to specific directive constants in the 'directives' array output:
-        - If rule implies AI generation (e.g. "Background... must be AI-generated"): add "MANDATORY_GEN_FILL" and force method='GENERATIVE'.
-        - If rule implies vertical centering (e.g. "must be centered vertically"): add "ENFORCE_CENTER_ALIGN".
-        - If rule implies grid division (e.g. "5 equal parts"): add "FORCE_5_COLUMN_DIVISION".
-        - If rule implies removing elements: add "REMOVE_NON_COMPLIANT".
-        - Add any other critical mandates as UPPERCASE_SNAKE_CASE strings.
-        
-        GROUNDING PROTOCOL:
-        1. Link every visual observation to a Metadata ID [layer-ID] using the deterministic path IDs provided in the JSON hierarchy.
-        2. Use the Image for visual auditing and JSON for coordinate mapping.
-        3. The top-left corner (0,0) of your visual workspace is the top-left of the Target Container (${targetData.name}).
+3. LAYER ROLES (classify each major layer):
+   • "flow" - Part of the main content, participates in grid/distribution
+   • "static" - Fixed UI element (headers, titles) - doesn't move with grid
+   • "overlay" - Attached to another layer (MUST specify linkedAnchorId)
+   • "background" - Full-bleed texture at bottom of stack
 
-        OPERATIONAL CONSTRAINTS:
-        - NO NEW ELEMENTS: Strictly forbidden unless 'GENERATIVE' method is forced by Knowledge.
-        - NO DELETION: Strictly forbidden. Every layer in the JSON must remain visible and accounted for.
-        - SURGICAL SWAP EXCEPTION: If 'GENERATIVE' or 'HYBRID' method is selected, you MAY identify one specific 'replaceLayerId' from the input to be replaced by the AI output.
-          * TEXTURE ISOLATION: When specifying a 'replaceLayerId' for a background swap, ensure you target the deepest specific texture layer, avoiding groups that contain foreground UI elements.
-          * The AI output will inherit the Z-index and name of the 'replaceLayerId'.
-          * This is the ONLY context where deletion/replacement is permitted.
-        - GENERATIVE PROMPT PURITY: If generating a replacement texture, your 'generativePrompt' must be explicit: "Analyze and regenerate the texture for [insert layer-ID here] only. Maintain the aesthetic style of the provided image but exclude all other container elements."
-        - NO CROPPING: Strictly forbidden. Use scale and position only.
-        - METHOD 'GEOMETRIC': 'generativePrompt' MUST be "".
+4. SCALE CALCULATION:
+   - Calculate suggestedScale so content fits within target bounds with proper padding
+   - If rules specify padding (e.g., "50px from edges"), account for it:
+     availableWidth = targetW - (2 × padding)
+   - Scale = min(availableWidth / contentWidth, availableHeight / contentHeight)
 
-        JSON OUTPUT RULES:
-        - Leading reasoning must justify 'overrides' by citing specific brand constraints (if found) or expert intuition.
-        - 'knowledgeApplied' must be set to true if Knowledge rules were explicitly used.
-        - RULE ATTRIBUTION: If 'knowledgeApplied' is true, every object in the 'overrides' array MUST include a 'citedRule' string (a concise summary of the specific brand rule applied).
-        - ANCHOR REFERENCING: If a visual anchor influenced the decision, include 'anchorIndex' (integer) referencing the 0-based index of the provided visual anchor.
-        - FALLBACK LOGIC: If a conflict exists between a textual rule and a visual anchor, prioritize the textual rule but note the conflict in the 'reasoning'.
-        - Your 'overrides' must accurately map to the 'layerId' strings provided in the hierarchy.
-    `;
-    
-    if (effectiveRules) {
-        prompt = `
-        [START KNOWLEDGE (SCOPED)]
-        ${effectiveRules}
-        [END KNOWLEDGE]
-        
-        CONTEXT SOURCE:
-        The rules above were extracted from "// [NAME] CONTAINER" blocks. They are strict hard constraints for this specific layout.
-        
-        CRITICAL: You are restricted to the following [CONTAINER PROTOCOL]. Ignore all previous generic design training that contradicts these specific rules.
-        
-        ` + prompt;
-    }
-    
+5. OVERRIDES (for layers needing special treatment):
+   Each override needs: layerId, xOffset, yOffset, individualScale, layoutRole
+   If applying a rule: add citedRule with the rule text
+
+═══════════════════════════════════════════════════════════════════════════════
+CONFIDENCE TRIANGULATION
+═══════════════════════════════════════════════════════════════════════════════
+Before finalizing, verify your decisions against THREE evidence sources:
+1. VISUAL: What do you actually see in the image?
+2. KNOWLEDGE: What do the design rules say?
+3. METADATA: What do the layer names suggest?
+
+Confidence levels:
+- HIGH (3/3 sources agree)
+- MEDIUM (2/3 sources agree)
+- LOW (0-1 sources agree - use geometric fallback)
+
+═══════════════════════════════════════════════════════════════════════════════
+OUTPUT REQUIREMENTS
+═══════════════════════════════════════════════════════════════════════════════
+- method: Always "GEOMETRIC" unless rules explicitly authorize "GENERATIVE"
+- generativePrompt: Empty string "" unless method is GENERATIVE
+- knowledgeApplied: true if you used any design rules
+- semanticAnchors: List 3-5 key visual elements that define this content
+- In "reasoning": Explain your layout decisions and how you applied the rules
+
+Think step by step:
+1. What content is in this container? (visual analysis)
+2. What do the rules require? (rule interpretation)
+3. How should elements be arranged in the new space? (composition)
+4. What scale and positions achieve proper spacing? (math)`;
+
     return prompt;
   };
 
@@ -877,16 +889,16 @@ export const DesignAnalystNode = memo(({ id, data }: NodeProps<PSDNodeData>) => 
       const sourceData = getSourceData(index);
       const targetData = getTargetData(index);
       if (!sourceData || !targetData) return;
-      
+
       const instanceState = analystInstances[index] || DEFAULT_INSTANCE_STATE;
       const modelConfig = MODELS[instanceState.selectedModel as ModelKey];
       const isMuted = instanceState.isKnowledgeMuted || false;
-      
+
       const targetName = targetData.name.toUpperCase();
       const globalRules = scopes['GLOBAL CONTEXT'] || [];
       const specificRules = scopes[targetName] || [];
-      
-      const effectiveRules = (!isMuted && activeKnowledge) 
+
+      const effectiveRules = (!isMuted && activeKnowledge)
           ? [...globalRules, ...specificRules].join('\n')
           : null;
 
@@ -895,128 +907,142 @@ export const DesignAnalystNode = memo(({ id, data }: NodeProps<PSDNodeData>) => 
       setAnalyzingInstances(prev => ({ ...prev, [index]: true }));
 
       try {
-        const apiKey = process.env.API_KEY;
-        if (!apiKey) throw new Error("API_KEY missing");
-
-        const ai = new GoogleGenAI({ apiKey });
         const systemInstruction = generateSystemInstruction(sourceData, targetData, effectiveRules);
-        
         const sourcePixelsBase64 = await extractSourcePixels(sourceData.layers as SerializableLayer[], sourceData.container.bounds);
 
-        const apiContents = history.map(msg => ({ role: msg.role, parts: [...msg.parts] }));
-        const lastMessage = apiContents[apiContents.length - 1];
+        // Build messages in provider-agnostic format
+        const messages: { role: 'user' | 'assistant'; content: ContentPart[] }[] = [];
 
-        if (lastMessage.role === 'user') {
-            const newParts: any[] = [];
-            if (effectiveKnowledge?.visualAnchors) {
-                effectiveKnowledge.visualAnchors.forEach((anchor, idx) => {
-                    newParts.push({ text: `[VISUAL_ANCHOR_${idx}]` });
-                    newParts.push({ inlineData: { mimeType: anchor.mimeType, data: anchor.data } });
-                });
-                if (effectiveKnowledge.visualAnchors.length > 0) {
-                    newParts.push({ text: "REFERENCED VISUAL ANCHORS (Strict Style & Layout Adherence Required. Reference by index in 'anchorIndex'):" });
+        for (const msg of history) {
+            const content: ContentPart[] = [];
+
+            // For the last user message, inject images
+            if (msg.role === 'user' && msg === history[history.length - 1]) {
+                // Add visual anchors from knowledge
+                if (effectiveKnowledge?.visualAnchors) {
+                    for (let idx = 0; idx < effectiveKnowledge.visualAnchors.length; idx++) {
+                        const anchor = effectiveKnowledge.visualAnchors[idx];
+                        content.push({ type: 'text', text: `[VISUAL_ANCHOR_${idx}]` });
+                        content.push({
+                            type: 'image_url',
+                            image_url: {
+                                url: `data:${anchor.mimeType};base64,${anchor.data}`,
+                                detail: 'low'  // Reduced from 'high' to save tokens for local models
+                            }
+                        });
+                    }
+                    if (effectiveKnowledge.visualAnchors.length > 0) {
+                        content.push({
+                            type: 'text',
+                            text: 'REFERENCED VISUAL ANCHORS (Strict Style & Layout Adherence Required. Reference by index in anchorIndex):'
+                        });
+                    }
+                }
+
+                // Add source container image
+                if (sourcePixelsBase64) {
+                    const base64Clean = sourcePixelsBase64.split(',')[1];
+                    content.push({
+                        type: 'image_url',
+                        image_url: {
+                            url: `data:image/png;base64,${base64Clean}`,
+                            detail: 'low'  // Reduced from 'high' to save tokens for local models
+                        }
+                    });
+                    content.push({
+                        type: 'text',
+                        text: 'INPUT SOURCE CONTEXT (Visual Representation of the Layers provided in JSON):'
+                    });
                 }
             }
-            if (sourcePixelsBase64) {
-                const base64Clean = sourcePixelsBase64.split(',')[1];
-                newParts.push({ inlineData: { mimeType: 'image/png', data: base64Clean } });
-                newParts.push({ text: "INPUT SOURCE CONTEXT (Visual Representation of the Layers provided in JSON):" });
+
+            // Add the actual message text
+            const msgText = msg.parts?.[0]?.text || '';
+            if (msgText) {
+                content.push({ type: 'text', text: msgText });
             }
-            newParts.push(...lastMessage.parts);
-            lastMessage.parts = newParts;
+
+            messages.push({
+                role: msg.role === 'model' ? 'assistant' : 'user',
+                content
+            });
         }
 
-        const requestConfig: any = {
-            systemInstruction,
-            responseMimeType: "application/json",
-            responseSchema: {
-                type: Type.OBJECT,
-                properties: {
-                    reasoning: { type: Type.STRING },
-                    method: { 
-                        type: Type.STRING, 
-                        enum: ['GEOMETRIC', 'GENERATIVE', 'HYBRID'],
-                        description: "Knowledge-Locked Property. Defaults to 'GEOMETRIC'. 'GENERATIVE'/'HYBRID' require explicit rule authorization."
+        // Define JSON Schema for structured output
+        const responseSchema: StructuredOutputSchema = {
+            type: 'object',
+            properties: {
+                reasoning: { type: 'string' },
+                method: { type: 'string', enum: ['GEOMETRIC', 'GENERATIVE', 'HYBRID'] },
+                spatialLayout: { type: 'string', enum: ['STRETCH_FILL', 'UNIFIED_FIT', 'ABSOLUTE_PIN'] },
+                suggestedScale: { type: 'number' },
+                anchor: { type: 'string', enum: ['TOP', 'CENTER', 'BOTTOM', 'STRETCH'] },
+                generativePrompt: { type: 'string' },
+                semanticAnchors: { type: 'array', items: { type: 'string' } },
+                clearance: { type: 'boolean' },
+                knowledgeApplied: { type: 'boolean' },
+                directives: { type: 'array', items: { type: 'string' } },
+                replaceLayerId: { type: 'string' },
+                triangulation: {
+                    type: 'object',
+                    properties: {
+                        visual_identification: { type: 'string' },
+                        knowledge_correlation: { type: 'string' },
+                        metadata_validation: { type: 'string' },
+                        evidence_count: { type: 'number' },
+                        confidence_verdict: { type: 'string', enum: ['HIGH', 'MEDIUM', 'LOW'] }
                     },
-                    spatialLayout: {
-                        type: Type.STRING,
-                        enum: ['STRETCH_FILL', 'UNIFIED_FIT', 'ABSOLUTE_PIN'],
-                        description: "Spatial Strategy: 'STRETCH_FILL' for backgrounds, 'UNIFIED_FIT' for content groups, 'ABSOLUTE_PIN' for floating UI."
-                    },
-                    suggestedScale: { type: Type.NUMBER },
-                    anchor: { type: Type.STRING, enum: ['TOP', 'CENTER', 'BOTTOM', 'STRETCH'] },
-                    generativePrompt: { type: Type.STRING },
-                    semanticAnchors: { type: Type.ARRAY, items: { type: Type.STRING } },
-                    clearance: { type: Type.BOOLEAN },
-                    knowledgeApplied: { type: Type.BOOLEAN },
-                    directives: { type: Type.ARRAY, items: { type: Type.STRING } },
-                    replaceLayerId: { type: Type.STRING },
-                    
-                    triangulation: {
-                        type: Type.OBJECT,
-                        properties: {
-                            visual_identification: { type: Type.STRING },
-                            knowledge_correlation: { type: Type.STRING },
-                            metadata_validation: { type: Type.STRING },
-                            evidence_count: { type: Type.NUMBER },
-                            confidence_verdict: { type: Type.STRING, enum: ['HIGH', 'MEDIUM', 'LOW'] }
-                        },
-                        required: ['visual_identification', 'knowledge_correlation', 'metadata_validation', 'evidence_count', 'confidence_verdict']
-                    },
-                    
-                    layoutMode: { 
-                        type: Type.STRING, 
-                        enum: ['STANDARD', 'DISTRIBUTE_HORIZONTAL', 'DISTRIBUTE_VERTICAL', 'GRID'] 
-                    },
-                    physicsRules: {
-                        type: Type.OBJECT,
-                        properties: {
-                            preventOverlap: { type: Type.BOOLEAN },
-                            preventClipping: { type: Type.BOOLEAN }
-                        }
-                    },
-
-                    overrides: {
-                        type: Type.ARRAY,
-                        items: {
-                            type: Type.OBJECT,
-                            properties: {
-                                layerId: { type: Type.STRING },
-                                xOffset: { type: Type.NUMBER },
-                                yOffset: { type: Type.NUMBER },
-                                individualScale: { type: Type.NUMBER },
-                                citedRule: { type: Type.STRING },
-                                anchorIndex: { type: Type.INTEGER },
-                                layoutRole: { type: Type.STRING, enum: ['flow', 'static', 'overlay', 'background'] },
-                                linkedAnchorId: { type: Type.STRING }
-                            },
-                            required: ['layerId', 'xOffset', 'yOffset', 'individualScale']
-                        }
-                    },
-                    safetyReport: {
-                        type: Type.OBJECT,
-                        properties: {
-                            allowedBleed: { type: Type.BOOLEAN },
-                            violationCount: { type: Type.INTEGER }
-                        },
-                        required: ['allowedBleed', 'violationCount']
+                    required: ['visual_identification', 'knowledge_correlation', 'metadata_validation', 'evidence_count', 'confidence_verdict']
+                },
+                layoutMode: { type: 'string', enum: ['STANDARD', 'DISTRIBUTE_HORIZONTAL', 'DISTRIBUTE_VERTICAL', 'GRID'] },
+                physicsRules: {
+                    type: 'object',
+                    properties: {
+                        preventOverlap: { type: 'boolean' },
+                        preventClipping: { type: 'boolean' }
                     }
                 },
-                required: ['reasoning', 'method', 'spatialLayout', 'suggestedScale', 'anchor', 'generativePrompt', 'semanticAnchors', 'clearance', 'overrides', 'safetyReport', 'knowledgeApplied', 'directives', 'replaceLayerId', 'triangulation']
-            }
+                overrides: {
+                    type: 'array',
+                    items: {
+                        type: 'object',
+                        properties: {
+                            layerId: { type: 'string' },
+                            xOffset: { type: 'number' },
+                            yOffset: { type: 'number' },
+                            individualScale: { type: 'number' },
+                            citedRule: { type: 'string' },
+                            anchorIndex: { type: 'integer' },
+                            layoutRole: { type: 'string', enum: ['flow', 'static', 'overlay', 'background'] },
+                            linkedAnchorId: { type: 'string' }
+                        },
+                        required: ['layerId', 'xOffset', 'yOffset', 'individualScale']
+                    }
+                },
+                safetyReport: {
+                    type: 'object',
+                    properties: {
+                        allowedBleed: { type: 'boolean' },
+                        violationCount: { type: 'integer' }
+                    },
+                    required: ['allowedBleed', 'violationCount']
+                }
+            },
+            required: ['reasoning', 'method', 'spatialLayout', 'suggestedScale', 'anchor',
+                       'generativePrompt', 'semanticAnchors', 'clearance', 'overrides',
+                       'safetyReport', 'knowledgeApplied', 'directives', 'replaceLayerId', 'triangulation']
         };
-        
-        if (modelConfig.thinkingBudget) {
-            requestConfig.thinkingConfig = { thinkingBudget: modelConfig.thinkingBudget };
-        }
 
-        const response = await ai.models.generateContent({
-            model: modelConfig.apiModel,
-            contents: apiContents,
-            config: requestConfig
+        // Call unified AI provider
+        const response = await generateCompletion({
+            systemPrompt: systemInstruction,
+            messages,
+            responseSchema,
+            maxTokens: modelConfig.thinkingBudget || 4096,
+            temperature: 0.7
         });
 
-        const json = JSON.parse(response.text || '{}');
+        const json = response.json || {};
         
         // --- GEOMETRY FLAG INJECTION ---
         // Calculate ratio difference to flag the payload
@@ -1043,17 +1069,21 @@ export const DesignAnalystNode = memo(({ id, data }: NodeProps<PSDNodeData>) => 
         
         if (isMuted) json.knowledgeMuted = true;
 
+        // Create stripped version for persistence (removes base64 image data to prevent file bloat)
+        // sourceReference can be 20MB+ and would be stored in both chatHistory and layoutStrategy
+        const { sourceReference, ...persistableStrategy } = json;
+
         const newAiMessage: ChatMessage = {
             id: Date.now().toString(),
             role: 'model',
             parts: [{ text: response.text || '' }],
-            strategySnapshot: json,
+            strategySnapshot: persistableStrategy,  // No base64 data
             timestamp: Date.now()
         };
 
         const finalHistory = [...history, newAiMessage];
-        
-        updateInstanceState(index, { chatHistory: finalHistory, layoutStrategy: json });
+
+        updateInstanceState(index, { chatHistory: finalHistory, layoutStrategy: persistableStrategy });
 
         const isExplicitIntent = history.some(msg => msg.role === 'user' && /\b(generate|recreate|nano banana)\b/i.test(msg.parts[0].text));
         
@@ -1127,6 +1157,21 @@ export const DesignAnalystNode = memo(({ id, data }: NodeProps<PSDNodeData>) => 
              </div>
              <span className="text-[9px] text-purple-400 max-w-[200px] truncate">{titleSuffix}</span>
            </div>
+         </div>
+         {/* Server Status Indicator */}
+         <div className="flex items-center space-x-2">
+           <span className={`text-[9px] px-2 py-1 rounded font-mono font-bold tracking-wider border flex items-center gap-1.5 ${
+             getAIProviderConfig().provider === 'qwen-local'
+               ? 'bg-cyan-900/30 border-cyan-500/30 text-cyan-300'
+               : 'bg-blue-900/30 border-blue-500/30 text-blue-300'
+           }`}>
+             {getAIProviderConfig().provider === 'qwen-local' ? 'QWEN LOCAL' : 'GEMINI'}
+             <span className={`w-2 h-2 rounded-full ${
+               serverStatus === 'checking' ? 'bg-yellow-400 animate-pulse' :
+               serverStatus === 'online' ? 'bg-emerald-400 shadow-[0_0_4px_#10b981]' :
+               'bg-red-400 shadow-[0_0_4px_#f87171]'
+             }`} title={`Server ${serverStatus}`}></span>
+           </span>
          </div>
       </div>
       <div className="flex flex-col">
