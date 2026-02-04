@@ -53,10 +53,11 @@ LoadPSD → DesignInfo/TemplateSplitter → ContainerResolver → DesignAnalyst 
 
 **AI Provider Service** ([services/aiProviderService.ts](services/aiProviderService.ts)) - Qwen/Ollama AI abstraction:
 - `generateCompletion()`: Unified interface for text/vision inference with structured JSON output
-- Uses Ollama with local vision-language models (e.g., `minicpm-v:8b`, `qwen2.5vl:7b`)
-- Automatic image downscaling for local models (max 384px, aligned to 28px patch size)
-- Image count limit (`MAX_IMAGES_PER_REQUEST=2`) to avoid GGML tensor errors
-- Moderate context window for Ollama (`num_ctx: 8192`) balancing complexity vs stability
+- Uses Ollama with local vision-language models (e.g., `qwen2.5vl:7b`, `minicpm-v:8b`)
+- **Requires Ollama 0.12.11** - newer versions (0.13.x+) have GGML tensor bugs with vision models
+- Automatic image downscaling for local models (max 512px, aligned to 28px patch size)
+- Supports up to 8 images per request (`MAX_IMAGES_PER_REQUEST=8`)
+- Large context window for complex analysis (`num_ctx: 16384`)
 - JSON response parsing with markdown code fence stripping
 - Health checks for local servers via `checkQwenServerHealth()`
 - Debug logging for Qwen requests (model, image count, text length)
@@ -91,7 +92,7 @@ PSD files use a `!!TEMPLATE` top-level group containing container definitions. C
 ```bash
 # Qwen Local (Ollama) configuration
 VITE_QWEN_BASE_URL=http://localhost:11434/v1
-VITE_QWEN_MODEL=minicpm-v:8b  # or qwen2.5vl:7b for better reasoning
+VITE_QWEN_MODEL=qwen2.5vl:7b  # Recommended for best reasoning quality
 
 # ComfyUI (optional, for draft generation - currently disabled)
 VITE_COMFYUI_URL=http://127.0.0.1:8188
@@ -99,26 +100,17 @@ VITE_COMFYUI_URL=http://127.0.0.1:8188
 
 #### Ollama Setup
 
-1. Install Ollama from https://ollama.com/download/windows
-2. Pull a vision model: `ollama pull minicpm-v:8b` (stable) or `ollama pull qwen2.5vl:7b` (requires ~17GB VRAM)
+**IMPORTANT: Use Ollama 0.12.11** - versions 0.13.x+ have GGML tensor bugs with vision models.
+
+1. Download Ollama 0.12.11: https://github.com/ollama/ollama/releases/download/v0.12.11/OllamaSetup.exe
+2. Install and verify: `ollama --version` should show `0.12.11`
+3. Pull the vision model: `ollama pull qwen2.5vl:7b` (requires ~17GB VRAM)
 
 **Model Options** (configured via `VITE_QWEN_MODEL` in `.env.local`):
-- `minicpm-v:8b`: Stable vision model, recommended for most setups
-- `qwen2.5vl:7b`: Superior reasoning for complex layouts, but has known GGML tensor errors with certain image dimensions
+- `qwen2.5vl:7b`: **Recommended** - Superior reasoning for complex layouts, works reliably on Ollama 0.12.11
+- `minicpm-v:8b`: Alternative vision model, lower VRAM requirements (~8GB)
 
-**Note:** Model selection is configured via environment variable only. The UI displays the current model but does not provide a selector (previous Gemini multi-model support was removed).
-
-**Known Issues with qwen2.5vl:7b:**
-- GGML assertion errors (`a->ne[2] * 4 == b->ne[0]`) - this is a **known Ollama regression in versions 0.13.x+**
-- Root cause: Tensor dimension mismatch during RoPE (Rotary Position Embedding) in KV cache shifting
-- Triggers: Multiple images + large prompts + complex layer data (containers with ~12+ layers)
-- Mitigations applied:
-  - Images auto-downscaled to 384px and aligned to 28px patch size
-  - Image count limited to 2 per request (`MAX_IMAGES_PER_REQUEST`)
-  - Layer count in prompts limited to 12 (`MAX_LAYERS_IN_PROMPT`)
-  - Context window reduced to 8192 tokens
-- **Nuclear option:** Downgrade Ollama to 0.12.x (`ollama version 0.12.11` confirmed working)
-- **Recommended:** Use `minicpm-v:8b` which is more stable with vision tasks
+**Note:** Model selection is configured via environment variable only. The UI displays the current model but does not provide a selector.
 
 #### AI Features
 
@@ -186,15 +178,15 @@ Layout strategies include confidence triangulation (`TriangulationAudit`) with v
 - Draft generation disabled (requires ComfyUI integration)
 - **Token optimization for local models:**
   - Depth-limited layer flattening (`MAX_LAYER_DEPTH=3`) prevents token explosion on nested containers
-  - Layer sample capped at `MAX_LAYERS_IN_PROMPT=12` to reduce prompt size and avoid GGML errors
-  - Image detail set to 'low' for vision tokens
-  - Visual anchors limited to 1 per request (source image takes priority)
+  - Layer sample capped at `MAX_LAYERS_IN_PROMPT=20` for comprehensive container coverage
+  - Image detail set to 'high' for full resolution analysis
+  - All visual anchors included for complete style reference
 - **Persistence optimization:** `sourceReference` (base64 image) stripped from stored state to prevent project file bloat
 - **Configuration constants** (defined at module scope):
   - `ASPECT_RATIO_TOLERANCE=0.15`: Threshold for detecting geometry shift between source/target
   - `HEALTH_CHECK_INTERVAL_MS=30000`: Server health polling interval for local Ollama
   - `MAX_LAYER_DEPTH=3`: Maximum nesting depth for layer flattening in prompts
-  - `MAX_LAYERS_IN_PROMPT=12`: Maximum layers included in AI prompt (reduced from 20 for GGML stability)
+  - `MAX_LAYERS_IN_PROMPT=20`: Maximum layers included in AI prompt
   - `DRAFT_DEBOUNCE_MS=500`: Debounce delay for draft generation requests
 - **Error handling:** Per-instance error state with user-visible error display in UI
 
@@ -287,29 +279,30 @@ Layout strategies include confidence triangulation (`TriangulationAudit`) with v
 
 This is a **known regression in Ollama 0.13.x+** affecting Qwen2.5-VL vision models. The error occurs during RoPE (Rotary Position Embedding) tensor operations when the KV cache is shifted.
 
-**Triggers:**
-- Multiple images in a single request
-- Large context windows (>8192 tokens)
-- Complex prompts with many layers (~12+)
-- Containers with deeply nested layer hierarchies
+**Solution: Use Ollama 0.12.11**
 
-**Mitigations (already applied in code):**
-- Images downscaled to 384px max (was 512px)
-- Image count limited to 2 per request
-- Layer count limited to 12 per prompt (was 20)
-- Context window reduced to 8192 (was 16384)
-- Visual anchors limited to 1 (source image prioritized)
+```powershell
+# Download and install Ollama 0.12.11
+Invoke-WebRequest -Uri "https://github.com/ollama/ollama/releases/download/v0.12.11/OllamaSetup.exe" -OutFile "$env:TEMP\OllamaSetup-0.12.11.exe"
+Start-Process "$env:TEMP\OllamaSetup-0.12.11.exe" -Wait
 
-**If errors persist:**
-1. Switch to `minicpm-v:8b`: `VITE_QWEN_MODEL=minicpm-v:8b` (most stable)
-2. Downgrade Ollama to 0.12.x: `ollama version 0.12.11` confirmed working
-3. Disable knowledge visual anchors (mute knowledge in DesignAnalyst)
-4. Reduce container complexity (split large containers)
+# Verify version
+ollama --version  # Should show 0.12.11
+```
+
+With Ollama 0.12.11, qwen2.5vl:7b works reliably with full inference limits:
+- Images at 512px resolution
+- Up to 8 images per request
+- 16384 token context window
+- 20 layers in prompts
+- High detail image analysis
+
+**If you must use Ollama 0.13.x+:**
+The GGML bug requires conservative workarounds - reduce `MAX_IMAGE_DIMENSION` to 384, `MAX_IMAGES_PER_REQUEST` to 2, `num_ctx` to 8192, and `MAX_LAYERS_IN_PROMPT` to 12 in the code.
 
 **Model crashes with nested layer containers:**
 - Depth-limited flattening is applied (`MAX_LAYER_DEPTH=3`)
-- Layer count is capped at `MAX_LAYERS_IN_PROMPT=12` per analysis
-- If still crashing, the container may have too many layers for the context window
+- Layer count is capped at `MAX_LAYERS_IN_PROMPT=20` per analysis
 - Check browser console for `[Qwen]` debug logs showing request size
 - Constants can be adjusted in `DesignAnalystNode.tsx` if needed for specific hardware
 
