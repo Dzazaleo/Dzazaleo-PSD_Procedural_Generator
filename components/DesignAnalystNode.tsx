@@ -10,7 +10,6 @@ import { useKnowledgeScoper } from '../hooks/useKnowledgeScoper';
 import {
   generateCompletion,
   generateImageWithComfyUI,
-  getAIProviderConfig,
   checkQwenServerHealth,
   ContentPart,
   StructuredOutputSchema
@@ -18,46 +17,32 @@ import {
 import { Brain, BrainCircuit, Ban, ClipboardList, AlertCircle, RefreshCw, RotateCcw, Play, Eye, BookOpen, Tag, Activity, Expand, Minimize2, MapPin, Scaling } from 'lucide-react';
 import { Psd } from 'ag-psd';
 
-type ModelKey = 'gemini-3-flash' | 'gemini-3-pro' | 'gemini-3-pro-thinking';
+// Layout/Analysis Constants
+const ASPECT_RATIO_TOLERANCE = 0.15;
+const HEALTH_CHECK_INTERVAL_MS = 30000;
+const MAX_LAYER_DEPTH = 3;
+const MAX_LAYERS_IN_PROMPT = 20;
+const DRAFT_DEBOUNCE_MS = 500;
+
+// Model configuration for Qwen local
+type ModelKey = 'qwen-local';
+
+const MODELS: Record<ModelKey, { badgeClass: string; label: string }> = {
+  'qwen-local': {
+    badgeClass: 'bg-cyan-900/30 border-cyan-500/30 text-cyan-300',
+    label: 'QWEN LOCAL'
+  }
+};
+
+const getModelKey = (_value: string | undefined): ModelKey => 'qwen-local';
 
 const DEFAULT_INSTANCE_STATE: AnalystInstanceState = {
     chatHistory: [],
     layoutStrategy: null,
-    selectedModel: 'gemini-3-pro',
     isKnowledgeMuted: false
 };
 
-interface ModelConfig {
-  apiModel: string;
-  label: string;
-  badgeClass: string;
-  headerClass: string;
-  thinkingBudget?: number;
-}
-
-const MODELS: Record<ModelKey, ModelConfig> = {
-  'gemini-3-flash': {
-    apiModel: 'gemini-3-flash-preview',
-    label: 'FLASH',
-    badgeClass: 'bg-yellow-500 text-yellow-950 border-yellow-400',
-    headerClass: 'border-yellow-500/50 bg-yellow-900/20'
-  },
-  'gemini-3-pro': {
-    apiModel: 'gemini-3-pro-preview',
-    label: 'PRO',
-    badgeClass: 'bg-blue-600 text-white border-blue-500',
-    headerClass: 'border-blue-500/50 bg-blue-900/20'
-  },
-  'gemini-3-pro-thinking': {
-    apiModel: 'gemini-3-pro-preview',
-    label: 'DEEP THINKING',
-    badgeClass: 'bg-purple-600 text-white border-purple-500',
-    headerClass: 'border-purple-500/50 bg-purple-900/20',
-    thinkingBudget: 16384
-  }
-};
-
-const StrategyCard: React.FC<{ strategy: LayoutStrategy, modelConfig: ModelConfig }> = ({ strategy, modelConfig }) => {
+const StrategyCard: React.FC<{ strategy: LayoutStrategy }> = ({ strategy }) => {
     const overrideCount = strategy.overrides?.length || 0;
     const directives = strategy.directives || [];
     const triangulation = strategy.triangulation;
@@ -67,7 +52,7 @@ const StrategyCard: React.FC<{ strategy: LayoutStrategy, modelConfig: ModelConfi
     if (strategy.method === 'GENERATIVE') methodColor = 'text-purple-300 border-purple-500 bg-purple-900/20';
     else if (strategy.method === 'HYBRID') methodColor = 'text-pink-300 border-pink-500 bg-pink-900/20';
     else if (strategy.method === 'GEOMETRIC') methodColor = 'text-emerald-300 border-emerald-500 bg-emerald-900/20';
-    
+
     let confidenceColor = 'text-slate-400 border-slate-600 bg-slate-800';
     if (triangulation?.confidence_verdict === 'HIGH') confidenceColor = 'text-emerald-300 border-emerald-500 bg-emerald-900/20';
     else if (triangulation?.confidence_verdict === 'MEDIUM') confidenceColor = 'text-yellow-300 border-yellow-500 bg-yellow-900/20';
@@ -88,12 +73,12 @@ const StrategyCard: React.FC<{ strategy: LayoutStrategy, modelConfig: ModelConfi
     }
 
     return (
-        <div 
-            className={`bg-slate-800/80 border-l-2 p-3 rounded text-xs space-y-3 w-full cursor-text ${modelConfig.badgeClass.replace('bg-', 'border-').split(' ')[2]}`}
+        <div
+            className={`bg-slate-800/80 border-l-2 border-cyan-500 p-3 rounded text-xs space-y-3 w-full cursor-text`}
             onMouseDown={(e) => e.stopPropagation()}
         >
              <div className="flex justify-between border-b border-slate-700 pb-2">
-                <span className={`font-bold ${modelConfig.badgeClass.includes('yellow') ? 'text-yellow-400' : 'text-blue-300'}`}>SEMANTIC RECOMPOSITION</span>
+                <span className="font-bold text-cyan-300">SEMANTIC RECOMPOSITION</span>
                 <div className="flex items-center gap-1.5">
                     <span className={`text-[9px] px-1.5 py-0.5 rounded border font-mono font-bold tracking-wider flex items-center gap-1 ${spatialClass}`}>
                         {spatialIcon} {spatialLabel}
@@ -234,11 +219,26 @@ const StrategyCard: React.FC<{ strategy: LayoutStrategy, modelConfig: ModelConfi
     );
 };
 
-const InstanceRow: React.FC<any> = ({ 
-    nodeId, index, state, sourceData, targetData, onAnalyze, onModelChange, onToggleMute, onReset, isAnalyzing, compactMode, activeKnowledge 
+interface InstanceRowProps {
+  nodeId: string;
+  index: number;
+  state: AnalystInstanceState;
+  sourceData: MappingContext | null;
+  targetData: { bounds: { x: number; y: number; w: number; h: number }; name: string } | null;
+  onAnalyze: (index: number) => void;
+  onToggleMute: (index: number) => void;
+  onReset: (index: number) => void;
+  isAnalyzing: boolean;
+  compactMode: boolean;
+  activeKnowledge: KnowledgeContext | null;
+  error: string | null;
+}
+
+const InstanceRow: React.FC<InstanceRowProps> = ({
+    nodeId, index, state, sourceData, targetData, onAnalyze, onToggleMute, onReset, isAnalyzing, compactMode, activeKnowledge, error
 }) => {
     const chatContainerRef = useRef<HTMLDivElement>(null);
-    const activeModelConfig = MODELS[state.selectedModel as ModelKey];
+    const activeModelConfig = MODELS[getModelKey(state.selectedModel)];
     const isReady = !!sourceData && !!targetData;
     const targetName = targetData?.name || (sourceData?.container.containerName) || 'Unknown';
     const theme = getSemanticThemeObject(targetName, index);
@@ -247,7 +247,7 @@ const InstanceRow: React.FC<any> = ({
     const sRatio = sourceData ? sourceData.container.bounds.w / sourceData.container.bounds.h : 1;
     const tRatio = targetData ? targetData.bounds.w / targetData.bounds.h : 1;
     // 15% tolerance threshold for significance
-    const isGeoMismatch = sourceData && targetData && Math.abs(sRatio - tRatio) > 0.15;
+    const isGeoMismatch = sourceData && targetData && Math.abs(sRatio - tRatio) > ASPECT_RATIO_TOLERANCE;
 
     useEffect(() => {
         if (chatContainerRef.current) {
@@ -325,17 +325,9 @@ const InstanceRow: React.FC<any> = ({
                     </button>
 
                     <div className="relative">
-                        <select 
-                            value={state.selectedModel}
-                            onChange={(e) => onModelChange(index, e.target.value as ModelKey)}
-                            onClick={(e) => e.stopPropagation()}
-                            onMouseDown={(e) => e.stopPropagation()}
-                            className={`nodrag nopan appearance-none text-[9px] px-2 py-1 pr-4 rounded font-mono font-bold cursor-pointer outline-none border transition-colors duration-300 ${activeModelConfig.badgeClass}`}
-                        >
-                            <option value="gemini-3-flash" className="text-black bg-white">FLASH</option>
-                            <option value="gemini-3-pro" className="text-black bg-white">PRO</option>
-                            <option value="gemini-3-pro-thinking" className="text-black bg-white">DEEP</option>
-                        </select>
+                        <span className={`text-[9px] px-2 py-1 rounded font-mono font-bold border ${activeModelConfig.badgeClass}`}>
+                            {activeModelConfig.label}
+                        </span>
                     </div>
                 </div>
             </div>
@@ -387,7 +379,7 @@ const InstanceRow: React.FC<any> = ({
                     {state.chatHistory.length === 0 && (
                         <div className="h-full flex flex-col items-center justify-center text-slate-600 italic text-xs opacity-50"><span>Ready to analyze {targetData?.name || 'slot'}</span></div>
                     )}
-                    {state.chatHistory.map((msg: any, idx: number) => (
+                    {state.chatHistory.map((msg: ChatMessage, idx: number) => (
                         <div key={msg.id || idx} className={`flex flex-col ${msg.role === 'user' ? 'items-end' : 'items-start'}`}>
                             <div className={`max-w-[95%] rounded border p-3 text-xs leading-relaxed shadow-sm ${msg.role === 'user' ? 'bg-slate-800 border-slate-600 text-slate-200' : `bg-slate-800/50 ${activeModelConfig.badgeClass.replace('bg-', 'border-').split(' ')[0]} text-slate-300`}`}>
                                 {msg.parts?.[0]?.text && msg.role === 'user' && (<div className="whitespace-pre-wrap break-words">{msg.parts[0].text}</div>)}
@@ -428,8 +420,15 @@ const InstanceRow: React.FC<any> = ({
                     )}
                 </div>
 
+                {error && (
+                    <div className="flex items-center space-x-2 p-2 bg-red-900/30 border border-red-500/30 rounded text-red-200 text-xs">
+                        <AlertCircle className="w-4 h-4 text-red-400 shrink-0" />
+                        <span className="break-words">{error}</span>
+                    </div>
+                )}
+
                 <div className="flex items-center space-x-2 pt-2 border-t border-slate-700/30">
-                     <button 
+                     <button
                         onClick={(e) => { e.stopPropagation(); onAnalyze(index); }} 
                         onMouseDown={(e) => e.stopPropagation()} 
                         disabled={!isReady || isAnalyzing} 
@@ -450,6 +449,7 @@ const InstanceRow: React.FC<any> = ({
 
 export const DesignAnalystNode = memo(({ id, data }: NodeProps<PSDNodeData>) => {
   const [analyzingInstances, setAnalyzingInstances] = useState<Record<number, boolean>>({});
+  const [instanceErrors, setInstanceErrors] = useState<Record<number, string | null>>({});
   const [serverStatus, setServerStatus] = useState<'checking' | 'online' | 'offline'>('checking');
   const instanceCount = data.instanceCount || 1;
   const activeInstances = data.activeInstances;
@@ -471,25 +471,29 @@ export const DesignAnalystNode = memo(({ id, data }: NodeProps<PSDNodeData>) => 
        : Array.from({ length: instanceCount }, (_, i) => i);
   }, [instanceCount, activeInstances]);
 
-  // Server health check for local Qwen
+  // Server health check for Qwen/Ollama
   useEffect(() => {
     const checkServer = async () => {
-      const config = getAIProviderConfig();
-      if (config.provider === 'qwen-local') {
-        const healthy = await checkQwenServerHealth();
-        setServerStatus(healthy ? 'online' : 'offline');
-      } else {
-        setServerStatus('online'); // Gemini assumed online
-      }
+      const healthy = await checkQwenServerHealth();
+      setServerStatus(healthy ? 'online' : 'offline');
     };
     checkServer();
-    const interval = setInterval(checkServer, 30000); // Check every 30s
+    const interval = setInterval(checkServer, HEALTH_CHECK_INTERVAL_MS);
     return () => clearInterval(interval);
   }, []);
 
   useEffect(() => {
     return () => unregisterNode(id);
   }, [id, unregisterNode]);
+
+  // Cleanup timeout on unmount to prevent memory leak
+  useEffect(() => {
+    return () => {
+      if (draftTimeoutRef.current) {
+        clearTimeout(draftTimeoutRef.current);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     updateNodeInternals(id);
@@ -601,7 +605,7 @@ export const DesignAnalystNode = memo(({ id, data }: NodeProps<PSDNodeData>) => 
 
         if (sourceData) {
             const history = instanceState.chatHistory || [];
-            const hasExplicitKeywords = history.some(msg => msg.role === 'user' && /\b(generate|recreate|nano banana)\b/i.test(msg.parts[0].text));
+            const hasExplicitKeywords = history.some(msg => msg.role === 'user' && /\b(generate|recreate)\b/i.test(msg.parts[0].text));
             
             const augmentedContext: MappingContext = {
                 ...sourceData,
@@ -681,59 +685,21 @@ export const DesignAnalystNode = memo(({ id, data }: NodeProps<PSDNodeData>) => 
       flushPipelineInstance(id, `source-out-${index}`);
   }, [updateInstanceState, flushPipelineInstance, id]);
 
-  const handleModelChange = (index: number, model: ModelKey) => {
-      updateInstanceState(index, { selectedModel: model });
-  };
-  
-  const handleToggleMute = (index: number) => {
+  const handleToggleMute = useCallback((index: number) => {
       const currentState = analystInstances[index]?.isKnowledgeMuted || false;
       updateInstanceState(index, { isKnowledgeMuted: !currentState });
-  };
+  }, [analystInstances, updateInstanceState]);
 
   const generateDraft = async (prompt: string, sourceReference?: string): Promise<string | null> => {
-     const config = getAIProviderConfig();
-
-     // Use ComfyUI for local image generation (if available)
-     if (config.provider === 'qwen-local') {
-         const sourceUrl = sourceReference
-             ? `data:image/png;base64,${sourceReference}`
-             : undefined;
-         return generateImageWithComfyUI(prompt, sourceUrl, {
-             width: 256,
-             height: 256,
-             steps: 20
-         });
-     }
-
-     // Fallback: Gemini image generation for cloud provider
-     try {
-         const apiKey = import.meta.env.VITE_API_KEY;
-         if (!apiKey) return null;
-
-         const { GoogleGenAI } = await import('@google/genai');
-         const ai = new GoogleGenAI({ apiKey });
-         const parts: any[] = [];
-
-         if (sourceReference) {
-             const base64Data = sourceReference.includes('base64,') ? sourceReference.split('base64,')[1] : sourceReference;
-             parts.push({ inlineData: { mimeType: 'image/png', data: base64Data } });
-         }
-         parts.push({ text: `Generate a draft sketch (256x256) for: ${prompt}` });
-
-         const response = await ai.models.generateContent({
-             model: 'gemini-2.5-flash-image',
-             contents: { parts },
-             config: { imageConfig: { aspectRatio: "1:1" } }
-         });
-
-         for (const part of response.candidates?.[0]?.content?.parts || []) {
-            if (part.inlineData) { return `data:image/png;base64,${part.inlineData.data}`; }
-         }
-         return null;
-     } catch (e) {
-         console.error("Draft Generation Failed", e);
-         return null;
-     }
+     // Use ComfyUI for local image generation (returns null when disabled)
+     const sourceUrl = sourceReference
+         ? `data:image/png;base64,${sourceReference}`
+         : undefined;
+     return generateImageWithComfyUI(prompt, sourceUrl, {
+         width: 256,
+         height: 256,
+         steps: 20
+     });
   };
 
   const generateSystemInstruction = (sourceData: any, targetData: any, effectiveRules: string | null) => {
@@ -744,7 +710,7 @@ export const DesignAnalystNode = memo(({ id, data }: NodeProps<PSDNodeData>) => 
 
     // Depth-limited flattening to prevent token explosion on nested containers
     // maxDepth=3 allows deeper nesting while avoiding explosion (24GB VRAM has headroom)
-    const flattenLayers = (layers: SerializableLayer[], depth = 0, maxDepth = 3): any[] => {
+    const flattenLayers = (layers: SerializableLayer[], depth = 0, maxDepth = MAX_LAYER_DEPTH): any[] => {
         if (depth > maxDepth) return [];
 
         let flat: any[] = [];
@@ -784,7 +750,7 @@ export const DesignAnalystNode = memo(({ id, data }: NodeProps<PSDNodeData>) => 
 
     const sourceRatio = sourceW / sourceH;
     const targetRatio = targetW / targetH;
-    const isMismatch = Math.abs(sourceRatio - targetRatio) > 0.15;
+    const isMismatch = Math.abs(sourceRatio - targetRatio) > ASPECT_RATIO_TOLERANCE;
 
     const getOrientation = (w: number, h: number) => w > h ? "Landscape" : (h > w ? "Portrait" : "Square");
     const geometryContext = isMismatch
@@ -820,8 +786,8 @@ Target Container: "${targetData.name}" (${targetW}×${targetH}px)
 ${geometryContext}
 
 ${knowledgeSection}
-## LAYER DATA (use these exact IDs in overrides) - showing ${Math.min(20, layerAnalysisData.length)} of ${layerAnalysisData.length} layers
-${JSON.stringify(layerAnalysisData.slice(0, 20))}
+## LAYER DATA (use these exact IDs in overrides) - showing ${Math.min(MAX_LAYERS_IN_PROMPT, layerAnalysisData.length)} of ${layerAnalysisData.length} layers
+${JSON.stringify(layerAnalysisData.slice(0, MAX_LAYERS_IN_PROMPT))}
 
 ═══════════════════════════════════════════════════════════════════════════════
 YOUR DECISIONS
@@ -891,7 +857,6 @@ Think step by step:
       if (!sourceData || !targetData) return;
 
       const instanceState = analystInstances[index] || DEFAULT_INSTANCE_STATE;
-      const modelConfig = MODELS[instanceState.selectedModel as ModelKey];
       const isMuted = instanceState.isKnowledgeMuted || false;
 
       const targetName = targetData.name.toUpperCase();
@@ -905,6 +870,7 @@ Think step by step:
       const effectiveKnowledge = (!isMuted && activeKnowledge) ? activeKnowledge : null;
 
       setAnalyzingInstances(prev => ({ ...prev, [index]: true }));
+      setInstanceErrors(prev => ({ ...prev, [index]: null }));
 
       try {
         const systemInstruction = generateSystemInstruction(sourceData, targetData, effectiveRules);
@@ -1038,17 +1004,40 @@ Think step by step:
             systemPrompt: systemInstruction,
             messages,
             responseSchema,
-            maxTokens: modelConfig.thinkingBudget || 4096,
+            maxTokens: 4096,
             temperature: 0.7
         });
 
-        const json = response.json || {};
-        
+        const rawJson = response.json || {};
+
+        // Validate and provide defaults for required properties
+        const json = {
+            method: rawJson.method || 'GEOMETRIC',
+            spatialLayout: rawJson.spatialLayout || 'UNIFIED_FIT',
+            suggestedScale: rawJson.suggestedScale ?? 1,
+            anchor: rawJson.anchor || 'CENTER',
+            generativePrompt: rawJson.generativePrompt || '',
+            semanticAnchors: rawJson.semanticAnchors || [],
+            clearance: rawJson.clearance ?? false,
+            knowledgeApplied: rawJson.knowledgeApplied ?? false,
+            directives: rawJson.directives || [],
+            replaceLayerId: rawJson.replaceLayerId || '',
+            triangulation: rawJson.triangulation || null,
+            overrides: rawJson.overrides || [],
+            safetyReport: rawJson.safetyReport || { allowedBleed: false, violationCount: 0 },
+            reasoning: rawJson.reasoning || '',
+            layoutMode: rawJson.layoutMode,
+            physicsRules: rawJson.physicsRules,
+            sourceReference: undefined as string | undefined,
+            forceGeometryChange: false,
+            knowledgeMuted: false,
+        };
+
         // --- GEOMETRY FLAG INJECTION ---
         // Calculate ratio difference to flag the payload
         const sourceRatio = sourceData.container.bounds.w / sourceData.container.bounds.h;
         const targetRatio = targetData.bounds.w / targetData.bounds.h;
-        json.forceGeometryChange = Math.abs(sourceRatio - targetRatio) > 0.15;
+        json.forceGeometryChange = Math.abs(sourceRatio - targetRatio) > ASPECT_RATIO_TOLERANCE;
 
         if ((json.method === 'GENERATIVE' || json.method === 'HYBRID') && json.replaceLayerId) {
              const isolatedTexture = await extractSourcePixels(
@@ -1085,7 +1074,7 @@ Think step by step:
 
         updateInstanceState(index, { chatHistory: finalHistory, layoutStrategy: persistableStrategy });
 
-        const isExplicitIntent = history.some(msg => msg.role === 'user' && /\b(generate|recreate|nano banana)\b/i.test(msg.parts[0].text));
+        const isExplicitIntent = history.some(msg => msg.role === 'user' && /\b(generate|recreate)\b/i.test(msg.parts[0].text));
         
         const augmentedContext: MappingContext = {
             ...sourceData,
@@ -1108,11 +1097,13 @@ Think step by step:
                      };
                      registerResolved(id, `source-out-${index}`, contextWithPreview);
                  }
-             }, 500);
+             }, DRAFT_DEBOUNCE_MS);
         }
 
       } catch (e: any) {
           console.error("Analysis Failed:", e);
+          const errorMessage = e?.message || 'Analysis failed. Check console for details.';
+          setInstanceErrors(prev => ({ ...prev, [index]: errorMessage }));
       } finally {
           setAnalyzingInstances(prev => ({ ...prev, [index]: false }));
       }
@@ -1160,12 +1151,8 @@ Think step by step:
          </div>
          {/* Server Status Indicator */}
          <div className="flex items-center space-x-2">
-           <span className={`text-[9px] px-2 py-1 rounded font-mono font-bold tracking-wider border flex items-center gap-1.5 ${
-             getAIProviderConfig().provider === 'qwen-local'
-               ? 'bg-cyan-900/30 border-cyan-500/30 text-cyan-300'
-               : 'bg-blue-900/30 border-blue-500/30 text-blue-300'
-           }`}>
-             {getAIProviderConfig().provider === 'qwen-local' ? 'QWEN LOCAL' : 'GEMINI'}
+           <span className="text-[9px] px-2 py-1 rounded font-mono font-bold tracking-wider border flex items-center gap-1.5 bg-cyan-900/30 border-cyan-500/30 text-cyan-300">
+             QWEN LOCAL
              <span className={`w-2 h-2 rounded-full ${
                serverStatus === 'checking' ? 'bg-yellow-400 animate-pulse' :
                serverStatus === 'online' ? 'bg-emerald-400 shadow-[0_0_4px_#10b981]' :
@@ -1178,11 +1165,11 @@ Think step by step:
           {effectiveIndices.map((i) => {
               const state = analystInstances[i] || DEFAULT_INSTANCE_STATE;
               return (
-                  <InstanceRow 
+                  <InstanceRow
                       key={i} nodeId={id} index={i} state={state} sourceData={getSourceData(i)} targetData={getTargetData(i)}
-                      onAnalyze={handleAnalyze} onModelChange={handleModelChange} onToggleMute={handleToggleMute} onReset={handleReset}
+                      onAnalyze={handleAnalyze} onToggleMute={handleToggleMute} onReset={handleReset}
                       isAnalyzing={!!analyzingInstances[i]} compactMode={effectiveIndices.length > 1}
-                      activeKnowledge={activeKnowledge}
+                      activeKnowledge={activeKnowledge} error={instanceErrors[i] || null}
                   />
               );
           })}

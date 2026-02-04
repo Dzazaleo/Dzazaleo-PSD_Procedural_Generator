@@ -51,9 +51,9 @@ LoadPSD → DesignInfo/TemplateSplitter → ContainerResolver → DesignAnalyst 
 
 **SmartObjectRegistry** ([services/smartObjectRegistry.ts](services/smartObjectRegistry.ts)) - Module-scope singleton storing heavy `linkedFiles` binaries separately from React state.
 
-**AI Provider Service** ([services/aiProviderService.ts](services/aiProviderService.ts)) - Provider-agnostic AI abstraction:
+**AI Provider Service** ([services/aiProviderService.ts](services/aiProviderService.ts)) - Qwen/Ollama AI abstraction:
 - `generateCompletion()`: Unified interface for text/vision inference with structured JSON output
-- Supports Gemini (cloud) and Ollama (local) backends via `VITE_AI_PROVIDER` env var
+- Uses Ollama with local vision-language models (e.g., `minicpm-v:8b`, `qwen2.5vl:7b`)
 - Automatic image downscaling for local models (max 512px, aligned to 28px patch size)
 - Extended context window for Ollama (`num_ctx: 16384`) to handle complex prompts
 - JSON response parsing with markdown code fence stripping
@@ -82,38 +82,30 @@ PSD files use a `!!TEMPLATE` top-level group containing container definitions. C
 
 ### AI Integration
 
-**AI Provider Service** ([services/aiProviderService.ts](services/aiProviderService.ts)) - Abstraction layer supporting multiple AI backends:
-- `gemini`: Google Gemini API (cloud) - default
-- `qwen-local`: Ollama with local vision-language models (e.g., `minicpm-v:8b`)
+**AI Provider Service** ([services/aiProviderService.ts](services/aiProviderService.ts)) - Qwen/Ollama AI backend:
+- `qwen-local`: Ollama with local vision-language models (e.g., `minicpm-v:8b`, `qwen2.5vl:7b`)
 
 #### Environment Configuration (`.env.local`)
 
 ```bash
-# Provider selection: 'gemini' (cloud) or 'qwen-local' (Ollama)
-VITE_AI_PROVIDER=gemini
-
-# Gemini (cloud) - required if using gemini provider
-VITE_API_KEY=your-gemini-api-key
-
-# Qwen Local (Ollama) - required if using qwen-local provider
+# Qwen Local (Ollama) configuration
 VITE_QWEN_BASE_URL=http://localhost:11434/v1
-VITE_QWEN_MODEL=qwen2.5vl:7b  # or minicpm-v:8b for stability
+VITE_QWEN_MODEL=minicpm-v:8b  # or qwen2.5vl:7b for better reasoning
 
 # ComfyUI (optional, for draft generation - currently disabled)
 VITE_COMFYUI_URL=http://127.0.0.1:8188
 ```
 
-#### Local Ollama Setup
-
-To use local inference instead of cloud Gemini:
+#### Ollama Setup
 
 1. Install Ollama from https://ollama.com/download/windows
-2. Pull a vision model: `ollama pull qwen2.5vl:7b` (requires ~17GB VRAM)
-3. Set `VITE_AI_PROVIDER=qwen-local` in `.env.local`
+2. Pull a vision model: `ollama pull minicpm-v:8b` (stable) or `ollama pull qwen2.5vl:7b` (requires ~17GB VRAM)
 
-**Model Options:**
+**Model Options** (configured via `VITE_QWEN_MODEL` in `.env.local`):
+- `minicpm-v:8b`: Stable vision model, recommended for most setups
 - `qwen2.5vl:7b`: Superior reasoning for complex layouts, but has known GGML tensor errors with certain image dimensions
-- `minicpm-v:8b`: More stable alternative if qwen2.5vl crashes
+
+**Note:** Model selection is configured via environment variable only. The UI displays the current model but does not provide a selector (previous Gemini multi-model support was removed).
 
 **Known Issues with qwen2.5vl:7b:**
 - GGML assertion errors (`a->ne[2] * 4 == b->ne[0]`) on some image dimensions
@@ -125,7 +117,9 @@ To use local inference instead of cloud Gemini:
 Used for:
 - Layout analysis and strategy generation in DesignAnalyst
 - Design review and refinement in DesignReviewer
-- Generative fill proposals (when `generationAllowed` flag is true)
+- Knowledge distillation from brand manuals in KnowledgeNode
+
+**Note:** Image generation features (generative fill, draft previews) are currently disabled. They require ComfyUI integration which is not yet implemented.
 
 Layout strategies include confidence triangulation (`TriangulationAudit`) with visual, knowledge, and metadata validation.
 
@@ -173,20 +167,27 @@ Layout strategies include confidence triangulation (`TriangulationAudit`) with v
 - Registers resolved contexts with layers and bounds to `resolvedRegistry`
 
 **DesignAnalystNode** ([components/DesignAnalystNode.tsx](components/DesignAnalystNode.tsx)) - AI-powered layout strategist:
-- Uses `aiProviderService` for "Knowledge-Anchored Semantic Recomposition" (supports Gemini or local Ollama)
-- Server health indicator for local Ollama connections (checking/online/offline)
+- Uses `aiProviderService` for "Knowledge-Anchored Semantic Recomposition" via local Ollama
+- **Single AI provider**: Qwen local only (model configured via `VITE_QWEN_MODEL` env var, no UI selector)
+- Server health indicator for Ollama connections (checking/online/offline)
 - Multi-instance support for parallel container analysis
-- Model selection: Flash (fast), Pro (balanced), Deep Thinking (thorough)
 - Generates `LayoutStrategy` with: method (GEOMETRIC/GENERATIVE/HYBRID), spatial layout, scale, overrides
 - Confidence triangulation via visual, knowledge, and metadata vectors
 - Knowledge integration: scopes rules per container, respects mute toggle
 - Extracts semantic anchors for content preservation
-- Draft generation disabled by default (ComfyUI integration deferred)
+- Draft generation disabled (requires ComfyUI integration)
 - **Token optimization for local models:**
-  - Depth-limited layer flattening (`maxDepth=3`) prevents token explosion on nested containers
-  - Layer sample capped at 20 to reduce prompt size
+  - Depth-limited layer flattening (`MAX_LAYER_DEPTH=3`) prevents token explosion on nested containers
+  - Layer sample capped at `MAX_LAYERS_IN_PROMPT=20` to reduce prompt size
   - Image detail set to 'low' for vision tokens
 - **Persistence optimization:** `sourceReference` (base64 image) stripped from stored state to prevent project file bloat
+- **Configuration constants** (defined at module scope):
+  - `ASPECT_RATIO_TOLERANCE=0.15`: Threshold for detecting geometry shift between source/target
+  - `HEALTH_CHECK_INTERVAL_MS=30000`: Server health polling interval for local Ollama
+  - `MAX_LAYER_DEPTH=3`: Maximum nesting depth for layer flattening in prompts
+  - `MAX_LAYERS_IN_PROMPT=20`: Maximum layers included in AI prompt
+  - `DRAFT_DEBOUNCE_MS=500`: Debounce delay for draft generation requests
+- **Error handling:** Per-instance error state with user-visible error display in UI
 
 **RemapperNode** ([components/RemapperNode.tsx](components/RemapperNode.tsx)) - Transformation engine:
 - Applies geometric transforms from source to target bounds
@@ -202,7 +203,7 @@ Layout strategies include confidence triangulation (`TriangulationAudit`) with v
 **DesignReviewerNode** ([components/DesignReviewerNode.tsx](components/DesignReviewerNode.tsx)) - Quality gate and manual adjustment:
 - Natural language chat interface for layout tweaks ("Nudge title up 10px")
 - Semantic inspector showing layer roles (flow/static/overlay/background)
-- Generates override corrections via Gemini
+- Generates override corrections via local Qwen/Ollama
 - Feedback loop: pushes adjustments back to Remapper physics engine
 - Auto-verification when physics sync completes
 - Confidence badge display from upstream triangulation
@@ -264,6 +265,13 @@ Layout strategies include confidence triangulation (`TriangulationAudit`) with v
 
 ### Troubleshooting
 
+#### Vite/Build Issues
+
+**"Failed to resolve dependency" errors for monaco-editor:**
+- Monaco Editor is not used in this project
+- If `vite.config.ts` contains `optimizeDeps.include` entries for Monaco workers, remove them
+- The config should not reference any monaco-editor paths
+
 #### Local Ollama Issues
 
 **"GGML_ASSERT failed" errors with qwen2.5vl:**
@@ -272,9 +280,11 @@ Layout strategies include confidence triangulation (`TriangulationAudit`) with v
 - Workaround: Use `minicpm-v:8b` instead: `VITE_QWEN_MODEL=minicpm-v:8b`
 
 **Model crashes with nested layer containers:**
-- Depth-limited flattening is applied (`maxDepth=3`)
+- Depth-limited flattening is applied (`MAX_LAYER_DEPTH=3`)
+- Layer count is capped at `MAX_LAYERS_IN_PROMPT=20` per analysis
 - If still crashing, the container may have too many layers for the context window
 - Check browser console for `[Qwen]` debug logs showing request size
+- Constants can be adjusted in `DesignAnalystNode.tsx` if needed for specific hardware
 
 **Large project file sizes after analysis:**
 - Fixed: `sourceReference` base64 data is now stripped from persisted state
@@ -285,3 +295,9 @@ Layout strategies include confidence triangulation (`TriangulationAudit`) with v
 $env:OLLAMA_DEBUG="1"; ollama serve
 ```
 This enables verbose server-side logging to diagnose crashes.
+
+**Analysis failures:**
+- DesignAnalystNode displays error messages directly in the UI (red banner below chat)
+- Check browser console for detailed error stack traces
+- Common causes: network timeouts, malformed AI responses, missing source/target data
+- AI response validation provides sensible defaults if required fields are missing

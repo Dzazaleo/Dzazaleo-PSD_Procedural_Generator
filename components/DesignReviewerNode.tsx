@@ -3,7 +3,7 @@ import React, { memo, useState, useEffect, useCallback, useMemo, useRef } from '
 import { Handle, Position, NodeProps, useReactFlow, useUpdateNodeInternals, useEdges, useNodes } from 'reactflow';
 import { PSDNodeData, TransformedPayload, LayerOverride, ChatMessage, ReviewerStrategy, ReviewerInstanceState, TransformedLayer, FeedbackStrategy } from '../types';
 import { useProceduralStore } from '../store/ProceduralContext';
-import { GoogleGenAI, Type } from "@google/genai";
+import { generateCompletion, StructuredOutputSchema } from '../services/aiProviderService';
 import { Check, MessageSquare, AlertCircle, ShieldCheck, Search, Activity, Brain, Ban, Link as LinkIcon, Layers, Lock, Move, Anchor, Zap, RotateCcw } from 'lucide-react';
 
 const DEFAULT_INSTANCE_STATE: ReviewerInstanceState = {
@@ -381,12 +381,8 @@ export const DesignReviewerNode = memo(({ id, data }: NodeProps<PSDNodeData>) =>
 
     const performManualAudit = async (index: number, userMessage: string, currentHistory: ChatMessage[], payload: TransformedPayload) => {
         setAnalyzingInstances(prev => ({ ...prev, [index]: true }));
-        
-        try {
-            const apiKey = process.env.API_KEY;
-            if (!apiKey) throw new Error("API_KEY missing");
-            const ai = new GoogleGenAI({ apiKey });
 
+        try {
             // Fix: Normalize targetBounds to ensure x and y exist. Fallback to 0,0 if metrics.target is used.
             const targetBounds = payload.targetBounds || {
                 x: 0,
@@ -394,7 +390,7 @@ export const DesignReviewerNode = memo(({ id, data }: NodeProps<PSDNodeData>) =>
                 w: payload.metrics.target.w,
                 h: payload.metrics.target.h
             };
-            
+
             // FLATTEN HIERARCHY & CALCULATE RELATIVE OFFSETS
             // This ensures the AI sees every layer (including nested ones) and knows their exact
             // current relationship to the container origin.
@@ -418,68 +414,65 @@ export const DesignReviewerNode = memo(({ id, data }: NodeProps<PSDNodeData>) =>
             };
             flatten(payload.layers);
 
-            const systemInstruction = `
-                ROLE: Design Reviewer (Manual Override Mode).
-                TASK: Interpret the user's natural language request to adjust the layout.
-                CONTEXT: You are modifying a previously generated layout.
-                
-                TARGET CONTAINER ORIGIN: X=${targetBounds.x}, Y=${targetBounds.y}
-                
-                CURRENT LAYERS (Flattened & Relative):
-                ${JSON.stringify(flatLayers, null, 2)}
+            const systemInstruction = `ROLE: Design Reviewer (Manual Override Mode).
+TASK: Interpret the user's natural language request to adjust the layout.
+CONTEXT: You are modifying a previously generated layout.
 
-                KNOWLEDGE CONTEXT:
-                ${activeKnowledge ? activeKnowledge.rules : "No active rules."}
+TARGET CONTAINER ORIGIN: X=${targetBounds.x}, Y=${targetBounds.y}
 
-                USER REQUEST: "${userMessage}"
+CURRENT LAYERS (Flattened & Relative):
+${JSON.stringify(flatLayers, null, 2)}
 
-                OUTPUT:
-                Return a JSON object with an 'overrides' array.
-                Each override must have:
-                - layerId: The exact ID of the layer to move.
-                - xOffset: The NEW relative X offset from the container origin.
-                - yOffset: The NEW relative Y offset from the container origin.
-                - individualScale: The scale factor (default 1.0).
-                
-                CRITICAL MATH RULES:
-                1. You must calculate the NEW absolute relative offset.
-                2. Formula: NewOffset = CurrentRelativeOffset + UserNudge
-                3. Example: If user says "Nudge down 20px" and 'currentRelativeY' is 400:
-                   - Calculation: 400 + 20 = 420.
-                   - Output: "yOffset": 420.
-                4. DO NOT return the delta (20). Return the RESULT (420).
-                5. DO NOT assume the current position is 0. Use the provided 'currentRelativeX/Y'.
-            `;
+KNOWLEDGE CONTEXT:
+${activeKnowledge ? activeKnowledge.rules : "No active rules."}
 
-            const response = await ai.models.generateContent({
-                model: 'gemini-2.5-flash',
-                contents: [{ role: 'user', parts: [{ text: userMessage }] }],
-                config: {
-                    systemInstruction,
-                    responseMimeType: "application/json",
-                    responseSchema: {
-                        type: Type.OBJECT,
-                        properties: {
-                            reasoning: { type: Type.STRING },
-                            overrides: {
-                                type: Type.ARRAY,
-                                items: {
-                                    type: Type.OBJECT,
-                                    properties: {
-                                        layerId: { type: Type.STRING },
-                                        xOffset: { type: Type.NUMBER },
-                                        yOffset: { type: Type.NUMBER },
-                                        individualScale: { type: Type.NUMBER }
-                                    },
-                                    required: ['layerId', 'xOffset', 'yOffset', 'individualScale']
-                                }
-                            }
+OUTPUT:
+Return a JSON object with an 'overrides' array.
+Each override must have:
+- layerId: The exact ID of the layer to move.
+- xOffset: The NEW relative X offset from the container origin.
+- yOffset: The NEW relative Y offset from the container origin.
+- individualScale: The scale factor (default 1.0).
+
+CRITICAL MATH RULES:
+1. You must calculate the NEW absolute relative offset.
+2. Formula: NewOffset = CurrentRelativeOffset + UserNudge
+3. Example: If user says "Nudge down 20px" and 'currentRelativeY' is 400:
+   - Calculation: 400 + 20 = 420.
+   - Output: "yOffset": 420.
+4. DO NOT return the delta (20). Return the RESULT (420).
+5. DO NOT assume the current position is 0. Use the provided 'currentRelativeX/Y'.`;
+
+            const responseSchema: StructuredOutputSchema = {
+                type: 'object',
+                properties: {
+                    reasoning: { type: 'string' },
+                    overrides: {
+                        type: 'array',
+                        items: {
+                            type: 'object',
+                            properties: {
+                                layerId: { type: 'string' },
+                                xOffset: { type: 'number' },
+                                yOffset: { type: 'number' },
+                                individualScale: { type: 'number' }
+                            },
+                            required: ['layerId', 'xOffset', 'yOffset', 'individualScale']
                         }
                     }
-                }
+                },
+                required: ['reasoning', 'overrides']
+            };
+
+            const response = await generateCompletion({
+                systemPrompt: systemInstruction,
+                messages: [{ role: 'user', content: userMessage }],
+                responseSchema,
+                maxTokens: 2048,
+                temperature: 0.5
             });
 
-            const json = JSON.parse(response.text || '{}');
+            const json = response.json || {};
             
             // Construct the AI response message
             const aiMessage: ChatMessage = {

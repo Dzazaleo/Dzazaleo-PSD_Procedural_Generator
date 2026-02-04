@@ -60,7 +60,8 @@
       "Bash(ollama ps:*)",
       "WebFetch(domain:github.com)",
       "Bash(ollama pull:*)",
-      "Bash(ollama list:*)"
+      "Bash(ollama list:*)",
+      "Bash(git restore:*)"
     ]
   }
 }

@@ -4,7 +4,7 @@ import { useProceduralStore } from '../store/ProceduralContext';
 import { PSDNodeData, VisualAnchor, KnowledgeContext } from '../types';
 import { BookOpen, Image as ImageIcon, FileText, Trash2, UploadCloud, BrainCircuit, Loader2, CheckCircle2, AlertCircle, X, Layers, RefreshCw } from 'lucide-react';
 import * as pdfjsLib from 'pdfjs-dist';
-import { GoogleGenAI } from "@google/genai";
+import { generateCompletion } from '../services/aiProviderService';
 
 // Initialize PDF Worker from CDN to handle parsing off the main thread
 pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://esm.sh/pdfjs-dist@4.10.38/build/pdf.worker.min.mjs';
@@ -243,41 +243,40 @@ export const KnowledgeNode = memo(({ id, data }: NodeProps<PSDNodeData>) => {
         let finalRules = "";
 
         if (rawText.trim().length > 0) {
-            const apiKey = process.env.API_KEY;
-            if (apiKey) {
-                const ai = new GoogleGenAI({ apiKey });
-                const response = await ai.models.generateContent({
-                    model: 'gemini-3-flash-preview',
-                    contents: `
-                        SOURCE MATERIAL:
-                        ${rawText.substring(0, 25000)} // Truncate to be safe
-                        
-                        TASK:
-                        Summarize the above brand manual content into a concise list of actionable 'Procedural Design Rules'. 
-                        Focus on spatial layout, typography rules, color usage logic, and hierarchy.
-                        
-                        CRITICAL OUTPUT FORMAT:
-                        For every container-specific rule, you MUST wrap the block with start and end tags.
-                        
-                        Example:
-                        // HERO CONTAINER
-                        - Rules for hero section...
-                        // END OF HERO CONTAINER
-                        
-                        // FOOTER CONTAINER
-                        - Rules for footer...
-                        // END OF FOOTER CONTAINER
-                        
-                        For global rules, put them at the top without container tags.
-                        Format as plain text.
-                    `,
-                    config: {
-                        systemInstruction: "You are a Design Systems Lead. Extract strict procedural logic from brand guidelines using the // CONTAINER block syntax."
-                    }
+            try {
+                const response = await generateCompletion({
+                    systemPrompt: "You are a Design Systems Lead. Extract strict procedural logic from brand guidelines using the // CONTAINER block syntax.",
+                    messages: [{
+                        role: 'user',
+                        content: `SOURCE MATERIAL:
+${rawText.substring(0, 25000)}
+
+TASK:
+Summarize the above brand manual content into a concise list of actionable 'Procedural Design Rules'.
+Focus on spatial layout, typography rules, color usage logic, and hierarchy.
+
+CRITICAL OUTPUT FORMAT:
+For every container-specific rule, you MUST wrap the block with start and end tags.
+
+Example:
+// HERO CONTAINER
+- Rules for hero section...
+// END OF HERO CONTAINER
+
+// FOOTER CONTAINER
+- Rules for footer...
+// END OF FOOTER CONTAINER
+
+For global rules, put them at the top without container tags.
+Format as plain text.`
+                    }],
+                    maxTokens: 4096,
+                    temperature: 0.7
                 });
                 finalRules = response.text || "No rules generated.";
-            } else {
-                 finalRules = "API Key missing. Rules could not be distilled from text.";
+            } catch (e) {
+                console.error("Knowledge distillation failed:", e);
+                finalRules = "Failed to distill rules. Check Ollama server connection.";
             }
         } else if (visualAnchors.length > 0) {
             finalRules = "Adhere to the visual style, color palette, and spatial rhythm of the attached reference images.";

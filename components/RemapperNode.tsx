@@ -4,7 +4,6 @@ import React, { memo, useMemo, useEffect, useCallback, useState, useRef } from '
 import { Handle, Position, NodeProps, useEdges, useReactFlow, useNodes, useUpdateNodeInternals } from 'reactflow';
 import { PSDNodeData, SerializableLayer, TransformedPayload, TransformedLayer, MAX_BOUNDARY_VIOLATION_PERCENT, LayoutStrategy, LayerOverride } from '../types';
 import { useProceduralStore } from '../store/ProceduralContext';
-import { GoogleGenAI } from "@google/genai";
 import { Check, Sparkles, Info, Layers, Box, Cpu, BookOpen, Link as LinkIcon, Activity, Brain } from 'lucide-react';
 
 interface InstanceData {
@@ -29,23 +28,6 @@ interface InstanceData {
   strategyUsed?: boolean;
   isSemanticMode?: boolean;
 }
-
-// --- HELPER: Dynamic Aspect Ratio Resolution ---
-const getClosestAspectRatio = (width: number, height: number): string => {
-    const ratio = width / height;
-    const targets = {
-        "1:1": 1,
-        "3:4": 0.75,
-        "4:3": 1.333,
-        "9:16": 0.5625,
-        "16:9": 1.777
-    };
-    
-    // Find closest supported aspect ratio key
-    return Object.keys(targets).reduce((prev, curr) => 
-        Math.abs(targets[curr as keyof typeof targets] - ratio) < Math.abs(targets[prev as keyof typeof targets] - ratio) ? curr : prev
-    );
-};
 
 // --- SUB-COMPONENT: Generative Preview Overlay ---
 interface OverlayProps {
@@ -941,45 +923,10 @@ export const RemapperNode = memo(({ id, data }: NodeProps<PSDNodeData>) => {
             if (promptChanged || needsInitialPreview) {
                 if (isGeneratingPreview[idx] && !promptChanged) return;
                 if (currentPrompt) lastPromptsRef.current[idx] = currentPrompt;
-                const prompt = currentPrompt!;
-                const sourceRef = strategy?.sourceReference || storePayload?.sourceReference;
-                
-                // Get Target Bounds for Aspect Ratio Calculation
-                const bounds = instance.target.bounds || { w: 1024, h: 1024 };
-                const ratioEnum = getClosestAspectRatio(bounds.w, bounds.h);
 
-                const generateDraft = async () => {
-                    setIsGeneratingPreview(prev => ({...prev, [idx]: true}));
-                    updatePayload(id, `result-out-${idx}`, { isSynthesizing: true });
-                    try {
-                        const apiKey = process.env.API_KEY;
-                        if (!apiKey) return;
-                        const ai = new GoogleGenAI({ apiKey });
-                        const parts: any[] = [];
-                        if (sourceRef) parts.push({ inlineData: { mimeType: 'image/png', data: sourceRef.includes('base64,') ? sourceRef.split('base64,')[1] : sourceRef } });
-                        
-                        // CONSTRUCTION OF PROMPT (Dynamic Content Preservation & Geometry)
-                        let finalPrompt = prompt;
-                        if (strategy?.semanticAnchors && strategy.semanticAnchors.length > 0) {
-                            finalPrompt += `\n\n[MANDATORY PRESERVATION]\nThe following visual elements detected in the source MUST be preserved in the generated output:\n- ${strategy.semanticAnchors.join("\n- ")}\n\nDo not remove, distort, or reimagine these specific elements. Extend the canvas around them while maintaining their original visual style.`;
-                        }
-                        // Append Aspect Ratio Instruction
-                        finalPrompt += `\n\n[GEOMETRY]: Generate this image strictly in ${ratioEnum} aspect ratio. Fill the entire canvas. Do NOT add letterboxing or black bars.`;
-
-                        parts.push({ text: finalPrompt });
-                        const response = await ai.models.generateContent({ model: 'gemini-2.5-flash-image', contents: { parts }, config: { imageConfig: { aspectRatio: ratioEnum as any } } });
-                        let base64Data = null;
-                        for (const part of response.candidates?.[0]?.content?.parts || []) { if (part.inlineData) { base64Data = part.inlineData.data; break; } }
-                        if (base64Data) {
-                            const url = `data:image/png;base64,${base64Data}`;
-                            const previousUrl = previousBlobsRef.current[idx];
-                            if (previousUrl && previousUrl !== url && previousUrl.startsWith('blob:')) setTimeout(() => URL.revokeObjectURL(previousUrl), 2000);
-                            previousBlobsRef.current[idx] = url;
-                            updatePayload(id, `result-out-${idx}`, { previewUrl: url, isTransient: true, isSynthesizing: false, generationId: Date.now() });
-                        }
-                    } catch (e) { console.error("Draft Generation Failed", e); updatePayload(id, `result-out-${idx}`, { isSynthesizing: false }); } finally { setIsGeneratingPreview(prev => ({...prev, [idx]: false})); }
-                };
-                generateDraft();
+                // Draft generation disabled - requires ComfyUI or other local image backend
+                console.log('[RemapperNode] Draft generation disabled - requires ComfyUI or other local image backend');
+                updatePayload(id, `result-out-${idx}`, { isSynthesizing: false });
             }
         });
     }, [instances, isGeneratingPreview, id, updatePayload, payloadRegistry]);

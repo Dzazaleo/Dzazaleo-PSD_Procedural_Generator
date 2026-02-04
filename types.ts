@@ -295,8 +295,7 @@ export interface ChatMessage {
 export interface AnalystInstanceState {
   chatHistory: ChatMessage[];
   layoutStrategy: LayoutStrategy | null;
-  selectedModel: 'gemini-3-flash' | 'gemini-3-pro' | 'gemini-3-pro-thinking';
-  isKnowledgeMuted: boolean; 
+  isKnowledgeMuted: boolean;
 }
 
 export interface ReviewerInstanceState {

@@ -5,25 +5,7 @@ import { TransformedLayer, TransformedPayload, MappingContext, PSDNodeData } fro
 import { useProceduralStore } from '../store/ProceduralContext';
 import { findLayerByPath, writePsdFile, reconcileSmartObjectMatrix, getGlobalScaleFactors } from '../services/psdService';
 import { Layer, Psd } from 'ag-psd';
-import { GoogleGenAI } from "@google/genai";
 import { SmartObjectRegistry } from '../services/smartObjectRegistry';
-
-// Helper: Calculate closest supported aspect ratio for Nano Banana
-const getClosestAspectRatio = (width: number, height: number): string => {
-    const ratio = width / height;
-    const targets = {
-        "1:1": 1,
-        "3:4": 0.75,
-        "4:3": 1.333,
-        "9:16": 0.5625,
-        "16:9": 1.777
-    };
-    
-    // Find closest aspect ratio key
-    return Object.keys(targets).reduce((prev, curr) => 
-        Math.abs(targets[curr as keyof typeof targets] - ratio) < Math.abs(targets[prev as keyof typeof targets] - ratio) ? curr : prev
-    );
-};
 
 // Helper: Convert Base64 Data URI to HTMLCanvasElement
 const base64ToCanvas = (base64: string, width: number, height: number): Promise<HTMLCanvasElement | null> => {
@@ -98,62 +80,15 @@ const applyTransformToCanvas = (
     return canvas;
 };
 
-// Helper: Generate Image using GenAI SDK
+// Helper: Generate Image (DISABLED - requires ComfyUI or other local image backend)
 const generateLayerImage = async (
-    prompt: string, 
-    width: number, 
-    height: number, 
-    sourceReference?: string
+    _prompt: string,
+    _width: number,
+    _height: number,
+    _sourceReference?: string
 ): Promise<HTMLCanvasElement | null> => {
-    try {
-        const apiKey = process.env.API_KEY;
-        if (!apiKey) throw new Error("API Key missing");
-
-        const ai = new GoogleGenAI({ apiKey });
-        
-        // Construct Multi-Modal Request Parts
-        const parts: any[] = [];
-        
-        if (sourceReference) {
-            const base64Data = sourceReference.includes('base64,') 
-                ? sourceReference.split('base64,')[1] 
-                : sourceReference;
-            
-            parts.push({
-                inlineData: {
-                    mimeType: 'image/png',
-                    data: base64Data
-                }
-            });
-        }
-        
-        parts.push({ text: prompt });
-
-        const response = await ai.models.generateContent({
-            model: 'gemini-2.5-flash-image',
-            contents: { parts },
-            config: {
-                imageConfig: {
-                    aspectRatio: getClosestAspectRatio(width, height) as any
-                }
-            }
-        });
-        
-        let base64Data = null;
-        for (const part of response.candidates?.[0]?.content?.parts || []) {
-            if (part.inlineData) {
-                base64Data = part.inlineData.data;
-                break;
-            }
-        }
-        
-        if (!base64Data) throw new Error("No image data returned from API");
-        return base64ToCanvas(`data:image/png;base64,${base64Data}`, width, height);
-
-    } catch (e) {
-        console.error("Generative Fill Failed:", e);
-        return null;
-    }
+    console.log('[ExportPSDNode] Image generation disabled - requires ComfyUI or other local image backend');
+    return null;
 };
 
 export const ExportPSDNode = memo(({ id }: NodeProps) => {

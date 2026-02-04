@@ -7,12 +7,11 @@
  * Allows switching between cloud and local models without changing node code.
  */
 
-export type AIProvider = 'gemini' | 'qwen-local' | 'qwen-comfyui';
+export type AIProvider = 'qwen-local' | 'qwen-comfyui';
 
 export interface AIProviderConfig {
   provider: AIProvider;
   baseUrl?: string;        // For local servers (e.g., http://localhost:11434/v1 for Ollama)
-  apiKey?: string;         // For cloud providers
   model?: string;          // Model identifier
   comfyuiUrl?: string;     // For ComfyUI image generation
 }
@@ -57,9 +56,8 @@ export interface GenerateResult {
 // Default configuration - can be overridden via environment variables
 // Note: minicpm-v:8b is used as the default because qwen2.5vl:7b crashes with images
 const DEFAULT_CONFIG: AIProviderConfig = {
-  provider: (import.meta.env.VITE_AI_PROVIDER as AIProvider) || 'gemini',
+  provider: (import.meta.env.VITE_AI_PROVIDER as AIProvider) || 'qwen-local',
   baseUrl: import.meta.env.VITE_QWEN_BASE_URL || 'http://localhost:11434/v1',
-  apiKey: import.meta.env.VITE_API_KEY,
   model: import.meta.env.VITE_QWEN_MODEL || 'minicpm-v:8b',
   comfyuiUrl: import.meta.env.VITE_COMFYUI_URL || 'http://127.0.0.1:8188',
 };
@@ -301,99 +299,10 @@ async function generateWithQwenLocal(options: GenerateOptions): Promise<Generate
 }
 
 /**
- * Generate completion using Google Gemini
- */
-async function generateWithGemini(options: GenerateOptions): Promise<GenerateResult> {
-  const { GoogleGenAI, Type } = await import('@google/genai');
-  const { apiKey } = currentConfig;
-
-  if (!apiKey) {
-    throw new Error('Gemini API key not configured');
-  }
-
-  const ai = new GoogleGenAI({ apiKey });
-
-  // Convert schema to Gemini format
-  const convertSchemaToGemini = (schema: StructuredOutputSchema): any => {
-    const convertType = (prop: any): any => {
-      if (prop.type === 'string') return { type: Type.STRING, enum: prop.enum };
-      if (prop.type === 'number') return { type: Type.NUMBER };
-      if (prop.type === 'integer') return { type: Type.INTEGER };
-      if (prop.type === 'boolean') return { type: Type.BOOLEAN };
-      if (prop.type === 'array') {
-        return { type: Type.ARRAY, items: convertType(prop.items) };
-      }
-      if (prop.type === 'object') {
-        const props: any = {};
-        for (const [key, val] of Object.entries(prop.properties || {})) {
-          props[key] = convertType(val);
-        }
-        return { type: Type.OBJECT, properties: props, required: prop.required };
-      }
-      return { type: Type.STRING };
-    };
-    return convertType(schema);
-  };
-
-  const config: any = {
-    systemInstruction: options.systemPrompt,
-  };
-
-  if (options.responseSchema) {
-    config.responseMimeType = 'application/json';
-    config.responseSchema = convertSchemaToGemini(options.responseSchema);
-  }
-
-  // Convert messages to Gemini format
-  const contents = options.messages.map(msg => ({
-    role: msg.role === 'assistant' ? 'model' : 'user',
-    parts: typeof msg.content === 'string'
-      ? [{ text: msg.content }]
-      : msg.content.map(p => {
-          if (p.type === 'text') return { text: p.text };
-          if (p.type === 'image_url' && p.image_url?.url) {
-            const base64Match = p.image_url.url.match(/^data:([^;]+);base64,(.+)$/);
-            if (base64Match) {
-              return { inlineData: { mimeType: base64Match[1], data: base64Match[2] } };
-            }
-          }
-          return { text: '' };
-        })
-  }));
-
-  const response = await ai.models.generateContent({
-    model: 'gemini-3-pro-preview',
-    contents,
-    config
-  });
-
-  const text = response.text || '';
-  let json: any = undefined;
-
-  if (options.responseSchema) {
-    try {
-      json = JSON.parse(text);
-    } catch (e) {
-      console.warn('Failed to parse Gemini JSON response');
-    }
-  }
-
-  return { text, json };
-}
-
-/**
- * Main generate function - routes to appropriate provider
+ * Main generate function - uses Qwen via Ollama
  */
 export async function generateCompletion(options: GenerateOptions): Promise<GenerateResult> {
-  const { provider } = currentConfig;
-
-  switch (provider) {
-    case 'qwen-local':
-      return generateWithQwenLocal(options);
-    case 'gemini':
-    default:
-      return generateWithGemini(options);
-  }
+  return generateWithQwenLocal(options);
 }
 
 /**
