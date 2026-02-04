@@ -143,6 +143,10 @@ export interface LayoutStrategy {
   semanticAnchors?: string[]; // Procedural Feature Extraction
   forceGeometryChange?: boolean; // Flag to indicate significant aspect ratio shift
   reasoning: string;
+
+  // Phase 1 Prompt Engineering: Visual Analysis & Rule Citation
+  visualAnalysis?: string; // Detailed description of what the AI sees in the source image
+  rulesApplied?: Array<{ rule: string; application: string }>; // Citation of applied knowledge rules
   overrides?: LayerOverride[];
   directives?: string[]; 
   replaceLayerId?: string | null; 

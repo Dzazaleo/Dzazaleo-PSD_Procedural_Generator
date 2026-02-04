@@ -388,6 +388,45 @@ const InstanceRow: React.FC<InstanceRowProps> = ({
                                 {msg.role === 'model' && msg.strategySnapshot && (
                                     <div className="flex flex-col gap-3">
                                         <div className="space-y-1.5">
+                                            {/* Visual Analysis Section (new) */}
+                                            {msg.strategySnapshot.visualAnalysis && (
+                                                <div className="mb-2">
+                                                    <div className="flex items-center space-x-2 border-b border-teal-700/50 pb-1.5">
+                                                        <div className="p-1 bg-teal-500/20 rounded">
+                                                            <Eye className="w-3 h-3 text-teal-300" />
+                                                        </div>
+                                                        <span className="text-[10px] font-bold text-teal-200 uppercase tracking-widest">
+                                                            Visual Analysis
+                                                        </span>
+                                                    </div>
+                                                    <div className="text-slate-300 text-xs leading-relaxed whitespace-pre-wrap pl-1 mt-1">
+                                                        {msg.strategySnapshot.visualAnalysis}
+                                                    </div>
+                                                </div>
+                                            )}
+                                            {/* Rules Applied Section (new) */}
+                                            {msg.strategySnapshot.rulesApplied && msg.strategySnapshot.rulesApplied.length > 0 && (
+                                                <div className="mb-2">
+                                                    <div className="flex items-center space-x-2 border-b border-amber-700/50 pb-1.5">
+                                                        <div className="p-1 bg-amber-500/20 rounded">
+                                                            <BookOpen className="w-3 h-3 text-amber-300" />
+                                                        </div>
+                                                        <span className="text-[10px] font-bold text-amber-200 uppercase tracking-widest">
+                                                            Rules Applied ({msg.strategySnapshot.rulesApplied.length})
+                                                        </span>
+                                                    </div>
+                                                    <div className="pl-1 mt-1 space-y-1">
+                                                        {msg.strategySnapshot.rulesApplied.map((r: {rule: string, application: string}, idx: number) => (
+                                                            <div key={idx} className="text-xs">
+                                                                <span className="text-amber-300 font-mono">{r.rule}</span>
+                                                                <span className="text-slate-400"> → </span>
+                                                                <span className="text-slate-300">{r.application}</span>
+                                                            </div>
+                                                        ))}
+                                                    </div>
+                                                </div>
+                                            )}
+                                            {/* Expert Design Audit (reasoning) */}
                                             <div className="flex items-center space-x-2 border-b border-slate-700/50 pb-1.5">
                                                 <div className="p-1 bg-purple-500/20 rounded">
                                                     <Brain className="w-3 h-3 text-purple-300" />
@@ -703,7 +742,7 @@ export const DesignAnalystNode = memo(({ id, data }: NodeProps<PSDNodeData>) => 
      });
   };
 
-  const generateSystemInstruction = (sourceData: any, targetData: any, effectiveRules: string | null) => {
+  const generateSystemInstruction = (sourceData: any, targetData: any, effectiveRules: string | null, effectiveKnowledge: KnowledgeContext | null) => {
     const sourceW = sourceData.container.bounds.w;
     const sourceH = sourceData.container.bounds.h;
     const targetW = targetData.bounds.w;
@@ -755,66 +794,127 @@ export const DesignAnalystNode = memo(({ id, data }: NodeProps<PSDNodeData>) => 
 
     const getOrientation = (w: number, h: number) => w > h ? "Landscape" : (h > w ? "Portrait" : "Square");
     const geometryContext = isMismatch
-        ? `⚠️ GEOMETRY SHIFT: ${getOrientation(sourceW, sourceH)} → ${getOrientation(targetW, targetH)}. You must RECOMPOSE the layout, not just scale it.`
+        ? `GEOMETRY SHIFT: ${getOrientation(sourceW, sourceH)} -> ${getOrientation(targetW, targetH)}. You must RECOMPOSE the layout, not just scale it.`
         : `Geometry stable: similar aspect ratios.`;
 
-    // Build knowledge section if rules exist
+    // STEP 1: Visual Analysis Section (forces model to describe what it sees)
+    const visualAnalysisSection = `
+═══════════════════════════════════════════════════════════════════════════════
+STEP 1: VISUAL ANALYSIS (REQUIRED - Complete BEFORE making layout decisions)
+═══════════════════════════════════════════════════════════════════════════════
+Examine the INPUT SOURCE CONTEXT image and describe IN YOUR OUTPUT:
+
+1. CONTENT INVENTORY: List every distinct visual element you see
+   - Text elements: headlines, subheadings, body copy, labels
+   - Graphics: logos, icons, illustrations, photos
+   - Decorative: borders, shadows, gradients, patterns
+   - Background: solid colors, textures, images
+
+2. SPATIAL RELATIONSHIPS: How are elements arranged?
+   - Visual hierarchy (most prominent to least)
+   - Alignment patterns (left, center, grid)
+   - Spacing patterns (uniform, varied, grouped)
+
+3. STYLE CHARACTERISTICS: What defines the visual style?
+   - Color palette (list dominant colors)
+   - Typography style (serif/sans-serif, weights)
+   - Overall mood (corporate, playful, minimal, bold)
+
+Your "visualAnalysis" field MUST contain image-specific details, not generic descriptions.
+`;
+
+    // STEP 2: Knowledge Rules Section (strengthened with citation enforcement)
     const knowledgeSection = effectiveRules ? `
 ═══════════════════════════════════════════════════════════════════════════════
-DESIGN RULES (MANDATORY - THESE OVERRIDE ALL OTHER GUIDANCE)
+STEP 2: MANDATORY DESIGN RULES (MUST APPLY - Cite each rule)
 ═══════════════════════════════════════════════════════════════════════════════
+The following rules are NON-NEGOTIABLE. For EACH rule you MUST:
+- Apply it to your layout decisions
+- Add it to the "rulesApplied" array with explanation
+
+<RULES>
 ${effectiveRules}
-═══════════════════════════════════════════════════════════════════════════════
+</RULES>
 
-RULE INTERPRETATION:
-- "LAYOUT_METHOD: GRID_DISTRIBUTION" → Set layoutMode="GRID", distribute elements evenly
-- "SPACING: X px MIN_PADDING" → Ensure X pixels between elements and from edges
-- "SCALING: uniform" → All elements get the same scale factor
-- "HIERARCHICAL_ANCHORING: A over B" → Layer A must be centered on layer B
-- "UI_RESERVES: Lock X to POSITION" → That element is STATIC, pinned to that position
-- "CONSTRAINTS: No-Go Zones" → Elements must not overlap those regions
+RULE APPLICATION GUIDE:
+- "LAYOUT_METHOD: X" -> Set layoutMode to X
+- "SPACING: Npx" -> Calculate scale ensuring N pixels clearance
+- "HIERARCHY: A over B" -> Layer A must be visually prominent over B
+- "UI_RESERVES: Lock X" -> That element gets layoutRole="static"
 
-For EACH rule you apply, you MUST cite it in the override's "citedRule" field.
+EVERY override that implements a rule must include "citedRule" field.
+FAILURE TO CITE RULES = OUTPUT REJECTED
 ` : '';
+
+    // Visual Anchor Context Section (explains anchors before images appear)
+    const anchorSection = effectiveKnowledge?.visualAnchors?.length ? `
+═══════════════════════════════════════════════════════════════════════════════
+VISUAL ANCHOR COMPLIANCE (Match style to reference images)
+═══════════════════════════════════════════════════════════════════════════════
+You will see ${effectiveKnowledge.visualAnchors.length} VISUAL_ANCHOR image(s) below.
+These are AUTHORITATIVE style references.
+
+For each anchor, analyze and apply:
+- Layout patterns (grid, stack, centered)
+- Spacing and alignment conventions
+- Visual style elements (colors, typography feel)
+
+Reference anchors by index in your overrides (anchorIndex field).
+` : '';
+
+    // Layer Data Section (with semantic role hints)
+    const layerDataSection = `
+═══════════════════════════════════════════════════════════════════════════════
+LAYER DATA (Analyze PURPOSE, not just position)
+═══════════════════════════════════════════════════════════════════════════════
+For each layer, determine its SEMANTIC ROLE from name/position:
+- "background": bg, background, fill -> layoutRole="background"
+- "primary": title, headline, hero -> most important content
+- "secondary": subtitle, desc -> supporting content
+- "ui": button, cta, nav -> layoutRole="static"
+- "decorative": border, shadow, accent -> may scale differently
+
+LAYER INVENTORY (${Math.min(MAX_LAYERS_IN_PROMPT, layerAnalysisData.length)} of ${layerAnalysisData.length} layers):
+${JSON.stringify(layerAnalysisData.slice(0, MAX_LAYERS_IN_PROMPT))}
+`;
 
     const prompt = `You are a Layout Composition Expert. Your task is to analyze a PSD container and determine the optimal layout strategy for repositioning its content into a new target container.
 
 ═══════════════════════════════════════════════════════════════════════════════
 TASK SUMMARY
 ═══════════════════════════════════════════════════════════════════════════════
-Source Container: "${sourceData.container.containerName}" (${sourceW}×${sourceH}px)
-Target Container: "${targetData.name}" (${targetW}×${targetH}px)
+Source Container: "${sourceData.container.containerName}" (${sourceW}x${sourceH}px)
+Target Container: "${targetData.name}" (${targetW}x${targetH}px)
 ${geometryContext}
-
+${visualAnalysisSection}
 ${knowledgeSection}
-## LAYER DATA (use these exact IDs in overrides) - showing ${Math.min(MAX_LAYERS_IN_PROMPT, layerAnalysisData.length)} of ${layerAnalysisData.length} layers
-${JSON.stringify(layerAnalysisData.slice(0, MAX_LAYERS_IN_PROMPT))}
-
+${anchorSection}
+${layerDataSection}
 ═══════════════════════════════════════════════════════════════════════════════
 YOUR DECISIONS
 ═══════════════════════════════════════════════════════════════════════════════
 
 1. SPATIAL LAYOUT (pick ONE):
-   • "UNIFIED_FIT" (default) - Scale all content as one unit, maintain aspect ratio, center it
-   • "STRETCH_FILL" - For backgrounds/textures that should fill the entire container
-   • "ABSOLUTE_PIN" - For UI elements that need exact positioning (requires xOffset/yOffset)
+   - "UNIFIED_FIT" (default) - Scale all content as one unit, maintain aspect ratio, center it
+   - "STRETCH_FILL" - For backgrounds/textures that should fill the entire container
+   - "ABSOLUTE_PIN" - For UI elements that need exact positioning (requires xOffset/yOffset)
 
 2. LAYOUT MODE (if rules specify distribution):
-   • "STANDARD" - No special distribution
-   • "GRID" - Distribute elements in a grid pattern
-   • "DISTRIBUTE_HORIZONTAL" - Space elements evenly horizontally
-   • "DISTRIBUTE_VERTICAL" - Space elements evenly vertically
+   - "STANDARD" - No special distribution
+   - "GRID" - Distribute elements in a grid pattern
+   - "DISTRIBUTE_HORIZONTAL" - Space elements evenly horizontally
+   - "DISTRIBUTE_VERTICAL" - Space elements evenly vertically
 
 3. LAYER ROLES (classify each major layer):
-   • "flow" - Part of the main content, participates in grid/distribution
-   • "static" - Fixed UI element (headers, titles) - doesn't move with grid
-   • "overlay" - Attached to another layer (MUST specify linkedAnchorId)
-   • "background" - Full-bleed texture at bottom of stack
+   - "flow" - Part of the main content, participates in grid/distribution
+   - "static" - Fixed UI element (headers, titles) - doesn't move with grid
+   - "overlay" - Attached to another layer (MUST specify linkedAnchorId)
+   - "background" - Full-bleed texture at bottom of stack
 
 4. SCALE CALCULATION:
    - Calculate suggestedScale so content fits within target bounds with proper padding
    - If rules specify padding (e.g., "50px from edges"), account for it:
-     availableWidth = targetW - (2 × padding)
+     availableWidth = targetW - (2 x padding)
    - Scale = min(availableWidth / contentWidth, availableHeight / contentHeight)
 
 5. OVERRIDES (for layers needing special treatment):
@@ -837,15 +937,17 @@ Confidence levels:
 ═══════════════════════════════════════════════════════════════════════════════
 OUTPUT REQUIREMENTS
 ═══════════════════════════════════════════════════════════════════════════════
+- visualAnalysis: REQUIRED - Describe what you SEE in the source image (specific details, not generic)
+- rulesApplied: REQUIRED - Array of {rule, application} for each design rule you used
 - method: Always "GEOMETRIC" unless rules explicitly authorize "GENERATIVE"
 - generativePrompt: Empty string "" unless method is GENERATIVE
 - knowledgeApplied: true if you used any design rules
 - semanticAnchors: List 3-5 key visual elements that define this content
-- In "reasoning": Explain your layout decisions and how you applied the rules
+- reasoning: Explain your layout decisions and how you applied the rules
 
 Think step by step:
-1. What content is in this container? (visual analysis)
-2. What do the rules require? (rule interpretation)
+1. What content is in this container? (visual analysis -> visualAnalysis field)
+2. What do the rules require? (rule interpretation -> rulesApplied field)
 3. How should elements be arranged in the new space? (composition)
 4. What scale and positions achieve proper spacing? (math)`;
 
@@ -874,7 +976,8 @@ Think step by step:
       setInstanceErrors(prev => ({ ...prev, [index]: null }));
 
       try {
-        const systemInstruction = generateSystemInstruction(sourceData, targetData, effectiveRules);
+        const systemInstruction = generateSystemInstruction(sourceData, targetData, effectiveRules, effectiveKnowledge);
+        console.log('[Analyst] System prompt length:', systemInstruction.length, 'chars');
         const sourcePixelsBase64 = await extractSourcePixels(sourceData.layers as SerializableLayer[], sourceData.container.bounds);
 
         // Build messages in provider-agnostic format
@@ -942,6 +1045,18 @@ Think step by step:
         const responseSchema: StructuredOutputSchema = {
             type: 'object',
             properties: {
+                visualAnalysis: { type: 'string' },
+                rulesApplied: {
+                    type: 'array',
+                    items: {
+                        type: 'object',
+                        properties: {
+                            rule: { type: 'string' },
+                            application: { type: 'string' }
+                        },
+                        required: ['rule', 'application']
+                    }
+                },
                 reasoning: { type: 'string' },
                 method: { type: 'string', enum: ['GEOMETRIC', 'GENERATIVE', 'HYBRID'] },
                 spatialLayout: { type: 'string', enum: ['STRETCH_FILL', 'UNIFIED_FIT', 'ABSOLUTE_PIN'] },
@@ -998,9 +1113,9 @@ Think step by step:
                     required: ['allowedBleed', 'violationCount']
                 }
             },
-            required: ['reasoning', 'method', 'spatialLayout', 'suggestedScale', 'anchor',
+            required: ['visualAnalysis', 'rulesApplied', 'reasoning', 'method', 'spatialLayout', 'suggestedScale', 'anchor',
                        'generativePrompt', 'semanticAnchors', 'clearance', 'overrides',
-                       'safetyReport', 'knowledgeApplied', 'directives', 'replaceLayerId', 'triangulation']
+                       'safetyReport', 'knowledgeApplied', 'directives', 'replaceLayerId']
         };
 
         // Call unified AI provider
@@ -1016,6 +1131,8 @@ Think step by step:
 
         // Validate and provide defaults for required properties
         const json = {
+            visualAnalysis: rawJson.visualAnalysis || '',
+            rulesApplied: rawJson.rulesApplied || [],
             method: rawJson.method || 'GEOMETRIC',
             spatialLayout: rawJson.spatialLayout || 'UNIFIED_FIT',
             suggestedScale: rawJson.suggestedScale ?? 1,
@@ -1061,6 +1178,10 @@ Think step by step:
         }
         
         if (isMuted) json.knowledgeMuted = true;
+
+        // Debug: Log new prompt engineering fields
+        console.log('[Analyst] Response - visualAnalysis length:', json.visualAnalysis?.length || 0);
+        console.log('[Analyst] Response - rulesApplied count:', json.rulesApplied?.length || 0);
 
         // Create stripped version for persistence (removes base64 image data to prevent file bloat)
         // sourceReference can be 20MB+ and would be stored in both chatHistory and layoutStrategy
