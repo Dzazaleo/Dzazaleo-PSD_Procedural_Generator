@@ -21,6 +21,7 @@ import { Psd } from 'ag-psd';
 const ASPECT_RATIO_TOLERANCE = 0.15;
 const HEALTH_CHECK_INTERVAL_MS = 30000;
 const MAX_LAYER_DEPTH = 3;
+// Layer count for prompt context - provides good coverage of container contents
 const MAX_LAYERS_IN_PROMPT = 20;
 const DRAFT_DEBOUNCE_MS = 500;
 
@@ -883,8 +884,27 @@ Think step by step:
             const content: ContentPart[] = [];
 
             // For the last user message, inject images
+            // IMPORTANT: Source image is prioritized first to ensure it's always included
+            // Visual anchors are added after, but may be skipped by aiProviderService
+            // to avoid GGML tensor dimension errors in Ollama 0.13+ (MAX_IMAGES_PER_REQUEST limit)
             if (msg.role === 'user' && msg === history[history.length - 1]) {
-                // Add visual anchors from knowledge
+                // Add source container image (primary visual context)
+                if (sourcePixelsBase64) {
+                    const base64Clean = sourcePixelsBase64.split(',')[1];
+                    content.push({
+                        type: 'image_url',
+                        image_url: {
+                            url: `data:image/png;base64,${base64Clean}`,
+                            detail: 'high'
+                        }
+                    });
+                    content.push({
+                        type: 'text',
+                        text: 'INPUT SOURCE CONTEXT (Visual Representation of the Layers provided in JSON):'
+                    });
+                }
+
+                // Add visual anchors from knowledge for style reference
                 if (effectiveKnowledge?.visualAnchors) {
                     for (let idx = 0; idx < effectiveKnowledge.visualAnchors.length; idx++) {
                         const anchor = effectiveKnowledge.visualAnchors[idx];
@@ -893,7 +913,7 @@ Think step by step:
                             type: 'image_url',
                             image_url: {
                                 url: `data:${anchor.mimeType};base64,${anchor.data}`,
-                                detail: 'low'  // Reduced from 'high' to save tokens for local models
+                                detail: 'high'
                             }
                         });
                     }
@@ -903,22 +923,6 @@ Think step by step:
                             text: 'REFERENCED VISUAL ANCHORS (Strict Style & Layout Adherence Required. Reference by index in anchorIndex):'
                         });
                     }
-                }
-
-                // Add source container image
-                if (sourcePixelsBase64) {
-                    const base64Clean = sourcePixelsBase64.split(',')[1];
-                    content.push({
-                        type: 'image_url',
-                        image_url: {
-                            url: `data:image/png;base64,${base64Clean}`,
-                            detail: 'low'  // Reduced from 'high' to save tokens for local models
-                        }
-                    });
-                    content.push({
-                        type: 'text',
-                        text: 'INPUT SOURCE CONTEXT (Visual Representation of the Layers provided in JSON):'
-                    });
                 }
             }
 

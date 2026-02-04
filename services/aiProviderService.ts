@@ -73,8 +73,11 @@ export function getAIProviderConfig(): AIProviderConfig {
 }
 
 // Maximum image dimension for local vision models (reduces VRAM usage)
-// 512px provides good balance for layout analysis with 24GB VRAM
+// 512px provides good detail while keeping VRAM reasonable
 const MAX_IMAGE_DIMENSION = 512;
+
+// Maximum number of images per request (Ollama 0.12.x handles this well)
+const MAX_IMAGES_PER_REQUEST = 8;
 
 /**
  * Downscale a base64 image to reduce VRAM usage for local vision models
@@ -139,13 +142,21 @@ async function downscaleImageForOllama(dataUrl: string): Promise<string> {
 
 /**
  * Process content parts to downscale any images for Ollama
+ * Also enforces MAX_IMAGES_PER_REQUEST to avoid GGML tensor dimension errors
  */
 async function processContentForOllama(content: ContentPart[]): Promise<ContentPart[]> {
   const processed: ContentPart[] = [];
   let imageCount = 0;
+  let skippedImages = 0;
 
   for (const part of content) {
     if (part.type === 'image_url' && part.image_url?.url) {
+      // Enforce image limit to prevent GGML tensor errors in Ollama 0.13+
+      if (imageCount >= MAX_IMAGES_PER_REQUEST) {
+        skippedImages++;
+        console.warn(`[Qwen] Skipping image ${imageCount + skippedImages} (limit: ${MAX_IMAGES_PER_REQUEST}) to avoid GGML errors`);
+        continue;
+      }
       imageCount++;
       const downscaledUrl = await downscaleImageForOllama(part.image_url.url);
       processed.push({
@@ -160,7 +171,7 @@ async function processContentForOllama(content: ContentPart[]): Promise<ContentP
     }
   }
 
-  console.log(`[Qwen] Processed ${imageCount} images in content`);
+  console.log(`[Qwen] Processed ${imageCount} images (skipped ${skippedImages} to stay under limit)`);
   return processed;
 }
 
@@ -208,7 +219,7 @@ async function generateWithQwenLocal(options: GenerateOptions): Promise<Generate
     max_tokens: options.maxTokens || 4096,
     temperature: options.temperature ?? 0.7,
     // Ollama-specific: increase context window (default is only 2048)
-    // 16384 tokens uses more VRAM but allows complex prompts
+    // 16384 provides good context for complex layout analysis
     options: {
       num_ctx: 16384
     }

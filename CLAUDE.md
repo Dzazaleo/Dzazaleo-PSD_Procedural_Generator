@@ -54,8 +54,9 @@ LoadPSD → DesignInfo/TemplateSplitter → ContainerResolver → DesignAnalyst 
 **AI Provider Service** ([services/aiProviderService.ts](services/aiProviderService.ts)) - Qwen/Ollama AI abstraction:
 - `generateCompletion()`: Unified interface for text/vision inference with structured JSON output
 - Uses Ollama with local vision-language models (e.g., `minicpm-v:8b`, `qwen2.5vl:7b`)
-- Automatic image downscaling for local models (max 512px, aligned to 28px patch size)
-- Extended context window for Ollama (`num_ctx: 16384`) to handle complex prompts
+- Automatic image downscaling for local models (max 384px, aligned to 28px patch size)
+- Image count limit (`MAX_IMAGES_PER_REQUEST=2`) to avoid GGML tensor errors
+- Moderate context window for Ollama (`num_ctx: 8192`) balancing complexity vs stability
 - JSON response parsing with markdown code fence stripping
 - Health checks for local servers via `checkQwenServerHealth()`
 - Debug logging for Qwen requests (model, image count, text length)
@@ -108,9 +109,16 @@ VITE_COMFYUI_URL=http://127.0.0.1:8188
 **Note:** Model selection is configured via environment variable only. The UI displays the current model but does not provide a selector (previous Gemini multi-model support was removed).
 
 **Known Issues with qwen2.5vl:7b:**
-- GGML assertion errors (`a->ne[2] * 4 == b->ne[0]`) on some image dimensions
-- Workaround: Images are auto-aligned to 28px patch size boundaries
-- If crashes persist, switch to `minicpm-v:8b`
+- GGML assertion errors (`a->ne[2] * 4 == b->ne[0]`) - this is a **known Ollama regression in versions 0.13.x+**
+- Root cause: Tensor dimension mismatch during RoPE (Rotary Position Embedding) in KV cache shifting
+- Triggers: Multiple images + large prompts + complex layer data (containers with ~12+ layers)
+- Mitigations applied:
+  - Images auto-downscaled to 384px and aligned to 28px patch size
+  - Image count limited to 2 per request (`MAX_IMAGES_PER_REQUEST`)
+  - Layer count in prompts limited to 12 (`MAX_LAYERS_IN_PROMPT`)
+  - Context window reduced to 8192 tokens
+- **Nuclear option:** Downgrade Ollama to 0.12.x (`ollama version 0.12.11` confirmed working)
+- **Recommended:** Use `minicpm-v:8b` which is more stable with vision tasks
 
 #### AI Features
 
@@ -178,14 +186,15 @@ Layout strategies include confidence triangulation (`TriangulationAudit`) with v
 - Draft generation disabled (requires ComfyUI integration)
 - **Token optimization for local models:**
   - Depth-limited layer flattening (`MAX_LAYER_DEPTH=3`) prevents token explosion on nested containers
-  - Layer sample capped at `MAX_LAYERS_IN_PROMPT=20` to reduce prompt size
+  - Layer sample capped at `MAX_LAYERS_IN_PROMPT=12` to reduce prompt size and avoid GGML errors
   - Image detail set to 'low' for vision tokens
+  - Visual anchors limited to 1 per request (source image takes priority)
 - **Persistence optimization:** `sourceReference` (base64 image) stripped from stored state to prevent project file bloat
 - **Configuration constants** (defined at module scope):
   - `ASPECT_RATIO_TOLERANCE=0.15`: Threshold for detecting geometry shift between source/target
   - `HEALTH_CHECK_INTERVAL_MS=30000`: Server health polling interval for local Ollama
   - `MAX_LAYER_DEPTH=3`: Maximum nesting depth for layer flattening in prompts
-  - `MAX_LAYERS_IN_PROMPT=20`: Maximum layers included in AI prompt
+  - `MAX_LAYERS_IN_PROMPT=12`: Maximum layers included in AI prompt (reduced from 20 for GGML stability)
   - `DRAFT_DEBOUNCE_MS=500`: Debounce delay for draft generation requests
 - **Error handling:** Per-instance error state with user-visible error display in UI
 
@@ -274,14 +283,32 @@ Layout strategies include confidence triangulation (`TriangulationAudit`) with v
 
 #### Local Ollama Issues
 
-**"GGML_ASSERT failed" errors with qwen2.5vl:**
-- This is a known bug in Ollama's GGML implementation for Qwen2.5-VL
-- Images are auto-resized to 28px-aligned dimensions, but some combinations still fail
-- Workaround: Use `minicpm-v:8b` instead: `VITE_QWEN_MODEL=minicpm-v:8b`
+**"GGML_ASSERT(a->ne[2] * 4 == b->ne[0]) failed" errors with qwen2.5vl:**
+
+This is a **known regression in Ollama 0.13.x+** affecting Qwen2.5-VL vision models. The error occurs during RoPE (Rotary Position Embedding) tensor operations when the KV cache is shifted.
+
+**Triggers:**
+- Multiple images in a single request
+- Large context windows (>8192 tokens)
+- Complex prompts with many layers (~12+)
+- Containers with deeply nested layer hierarchies
+
+**Mitigations (already applied in code):**
+- Images downscaled to 384px max (was 512px)
+- Image count limited to 2 per request
+- Layer count limited to 12 per prompt (was 20)
+- Context window reduced to 8192 (was 16384)
+- Visual anchors limited to 1 (source image prioritized)
+
+**If errors persist:**
+1. Switch to `minicpm-v:8b`: `VITE_QWEN_MODEL=minicpm-v:8b` (most stable)
+2. Downgrade Ollama to 0.12.x: `ollama version 0.12.11` confirmed working
+3. Disable knowledge visual anchors (mute knowledge in DesignAnalyst)
+4. Reduce container complexity (split large containers)
 
 **Model crashes with nested layer containers:**
 - Depth-limited flattening is applied (`MAX_LAYER_DEPTH=3`)
-- Layer count is capped at `MAX_LAYERS_IN_PROMPT=20` per analysis
+- Layer count is capped at `MAX_LAYERS_IN_PROMPT=12` per analysis
 - If still crashing, the container may have too many layers for the context window
 - Check browser console for `[Qwen]` debug logs showing request size
 - Constants can be adjusted in `DesignAnalystNode.tsx` if needed for specific hardware
