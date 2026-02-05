@@ -79,9 +79,15 @@ const checkSynchronization = (payload: TransformedPayload | null, strategy: Revi
         if (Math.abs(layer.coords.x - expectedX) > EPSILON_PIXEL) return false;
         if (Math.abs(layer.coords.y - expectedY) > EPSILON_PIXEL) return false;
         
-        // Check Scale (Global Scale * Individual Scale)
-        const expectedScale = payload.scaleFactor * override.individualScale;
-        if (Math.abs(layer.transform.scaleX - expectedScale) > EPSILON_SCALE) return false;
+        // Check Scale — only validate explicit per-axis overrides.
+        // The Remapper computes scaleX differently per layoutRole (background uses
+        // container ratio, static ignores scaleFactor, etc.), so we cannot derive
+        // the correct expected value from individualScale alone. Position check
+        // above is the authoritative sync signal. Scale is only checked when the
+        // override explicitly carries a scaleX value (forward-compatible).
+        if (override.scaleX !== undefined) {
+            if (Math.abs(layer.transform.scaleX - override.scaleX) > EPSILON_SCALE) return false;
+        }
     }
 
     return true;

@@ -314,6 +314,32 @@ const getLayerAudit = (layers: TransformedLayer[]) => {
   return { pixel, group, generative, total: pixel + group + generative };
 };
 
+/** Recursively collect ALL TransformedLayer nodes into a flat array (by reference). */
+const flattenTransformedTree = (layers: TransformedLayer[]): TransformedLayer[] => {
+    const result: TransformedLayer[] = [];
+    const traverse = (nodes: TransformedLayer[]) => {
+        for (const node of nodes) {
+            result.push(node);
+            if (node.children) traverse(node.children);
+        }
+    };
+    traverse(layers);
+    return result;
+};
+
+/** Recursively collect ALL SerializableLayer nodes into a flat array (by reference). */
+const flattenSourceTree = (layers: SerializableLayer[]): SerializableLayer[] => {
+    const result: SerializableLayer[] = [];
+    const traverse = (nodes: SerializableLayer[]) => {
+        for (const node of nodes) {
+            result.push(node);
+            if (node.children) traverse(node.children);
+        }
+    };
+    traverse(layers);
+    return result;
+};
+
 const RemapperInstanceRow = memo(({ 
     instance, confirmations, toggleInstanceGeneration, handleConfirmGeneration, handleImageLoad, isGeneratingPreview, displayPreviews, payloadRegistry, id, localSetting 
 }: {
@@ -834,23 +860,27 @@ export const RemapperNode = memo(({ id, data }: NodeProps<PSDNodeData>) => {
                         }
 
                         // C. OVERLAY SOLVER (Snap to Anchors)
-                        const overlayItems = transformed.filter(l => getOverride(l.id)?.layoutRole === 'overlay');
+                        // Flatten full tree so we can find overlay/anchor pairs at ANY depth
+                        const allTransformed = flattenTransformedTree(transformed);
+                        const allSourceLayers = sourceData.layers
+                            ? flattenSourceTree(sourceData.layers as SerializableLayer[])
+                            : [];
+
+                        const overlayItems = allTransformed.filter(l => getOverride(l.id)?.layoutRole === 'overlay');
                         overlayItems.forEach(l => {
                             const anchorId = getOverride(l.id)?.linkedAnchorId;
                             if (anchorId) {
-                                const anchor = transformed.find(t => t.id === anchorId);
+                                const anchor = allTransformed.find(t => t.id === anchorId);
                                 if (anchor) {
-                                    const sourceOverlay = sourceData.layers?.find(s => s.id === l.id);
-                                    const sourceAnchor = sourceData.layers?.find(s => s.id === anchorId);
-                                    
+                                    const sourceOverlay = allSourceLayers.find(s => s.id === l.id);
+                                    const sourceAnchor = allSourceLayers.find(s => s.id === anchorId);
+
                                     if (sourceOverlay && sourceAnchor) {
                                         const deltaX = sourceOverlay.coords.x - sourceAnchor.coords.x;
                                         const deltaY = sourceOverlay.coords.y - sourceAnchor.coords.y;
-                                        // Snap relative to Anchor's new position
-                                        // Use global scale (or anchor's scale)
                                         let newX = anchor.coords.x + (deltaX * baseXScale);
                                         let newY = anchor.coords.y + (deltaY * baseYScale);
-                                        
+
                                         l.coords.x = newX;
                                         l.coords.y = newY;
                                         l.transform.offsetX = newX;

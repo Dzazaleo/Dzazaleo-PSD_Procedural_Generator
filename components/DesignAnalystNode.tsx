@@ -14,7 +14,7 @@ import {
   ContentPart,
   StructuredOutputSchema
 } from '../services/aiProviderService';
-import { Brain, BrainCircuit, Ban, ClipboardList, AlertCircle, RefreshCw, RotateCcw, Play, Eye, BookOpen, Tag, Activity, Expand, Minimize2, MapPin, Scaling } from 'lucide-react';
+import { Brain, BrainCircuit, Ban, ClipboardList, AlertCircle, RefreshCw, RotateCcw, Play, Eye, BookOpen, Tag, Activity, Expand, Minimize2, MapPin, Scaling, Copy, Check } from 'lucide-react';
 import { Psd } from 'ag-psd';
 
 // Layout/Analysis Constants
@@ -250,10 +250,48 @@ interface InstanceRowProps {
   analysisStage: AnalysisStage;
 }
 
+const formatStrategyForCopy = (snapshot: LayoutStrategy): string => {
+    const lines: string[] = [];
+    if (snapshot.visualAnalysis) {
+        lines.push('=== VISUAL ANALYSIS ===', snapshot.visualAnalysis, '');
+    }
+    if (snapshot.rulesApplied && snapshot.rulesApplied.length > 0) {
+        lines.push('=== RULES APPLIED ===');
+        snapshot.rulesApplied.forEach((r: { rule: string; application: string }) => {
+            lines.push(`  ${r.rule} → ${r.application}`);
+        });
+        lines.push('');
+    }
+    if (snapshot.reasoning) {
+        lines.push('=== EXPERT DESIGN AUDIT ===', snapshot.reasoning, '');
+    }
+    lines.push('=== STRATEGY ===');
+    lines.push(`Method: ${snapshot.method || 'GEOMETRIC'}`);
+    lines.push(`Spatial Layout: ${snapshot.spatialLayout || 'UNIFIED_FIT'}`);
+    lines.push(`Anchor: ${snapshot.anchor || 'CENTER'}`);
+    lines.push(`Suggested Scale: ${(snapshot.suggestedScale ?? 1).toFixed(3)}x`);
+    if (snapshot.overrides && snapshot.overrides.length > 0) {
+        lines.push(`Overrides (${snapshot.overrides.length}):`);
+        snapshot.overrides.forEach((o: LayerOverride) => {
+            lines.push(`  [${o.layoutRole || 'flow'}] ${o.layerId} — scale: ${o.scaleX ?? o.individualScale ?? 1}x${o.scaleY ? '/' + o.scaleY + 'y' : ''}`);
+        });
+    }
+    if (snapshot.triangulation) {
+        const t = snapshot.triangulation;
+        lines.push('', '=== CONFIDENCE AUDIT ===');
+        lines.push(`Verdict: ${t.confidence_verdict} (${t.evidence_count}/3)`);
+        lines.push(`Visual: ${t.visual_identification}`);
+        lines.push(`Knowledge: ${t.knowledge_correlation}`);
+        lines.push(`Metadata: ${t.metadata_validation}`);
+    }
+    return lines.join('\n');
+};
+
 const InstanceRow: React.FC<InstanceRowProps> = ({
     index, state, sourceData, targetData, onAnalyze, onToggleMute, onReset, isAnalyzing, compactMode, activeKnowledge, error, analysisStage
 }) => {
     const chatContainerRef = useRef<HTMLDivElement>(null);
+    const [copiedMsgId, setCopiedMsgId] = useState<string | null>(null);
     const activeModelConfig = MODELS[getModelKey(state.selectedModel)];
     const isReady = !!sourceData && !!targetData;
     const targetName = targetData?.name || (sourceData?.container.containerName) || 'Unknown';
@@ -401,7 +439,24 @@ const InstanceRow: React.FC<InstanceRowProps> = ({
                                 {msg.parts?.[0]?.text && msg.role === 'user' && (<div className="whitespace-pre-wrap break-words">{msg.parts[0].text}</div>)}
                                 
                                 {msg.role === 'model' && msg.strategySnapshot && (
-                                    <div className="flex flex-col gap-3">
+                                    <div className="flex flex-col gap-3 relative">
+                                        <button
+                                            className="absolute top-0 right-0 p-1 rounded hover:bg-slate-700/60 text-slate-500 hover:text-slate-200 transition-colors z-10"
+                                            title="Copy analysis to clipboard"
+                                            onClick={async (e) => {
+                                                e.stopPropagation();
+                                                const text = formatStrategyForCopy(msg.strategySnapshot!);
+                                                try {
+                                                    await navigator.clipboard.writeText(text);
+                                                    setCopiedMsgId(msg.id || String(idx));
+                                                    setTimeout(() => setCopiedMsgId(null), 2000);
+                                                } catch (err) { console.error('Copy failed', err); }
+                                            }}
+                                        >
+                                            {copiedMsgId === (msg.id || String(idx))
+                                                ? <Check className="w-3 h-3 text-emerald-400" />
+                                                : <Copy className="w-3 h-3" />}
+                                        </button>
                                         <div className="space-y-1.5">
                                             {/* Visual Analysis Section (new) */}
                                             {msg.strategySnapshot.visualAnalysis && (
