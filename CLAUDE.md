@@ -73,9 +73,10 @@ LoadPSD → DesignInfo/TemplateSplitter → ContainerResolver → DesignAnalyst 
 
 [types.ts](types.ts) defines the domain model:
 - `SerializableLayer`: Lightweight layer representation with deterministic path IDs
-- `TransformedLayer`: Layer with applied transform (scale, offset, rotation)
+- `TransformedLayer`: Layer with applied transform (per-axis scale, offset, rotation) and semantic `layoutRole`
 - `TransformedPayload`: Complete mapping result with metrics, preview, and generation flags
-- `LayoutStrategy`: AI-generated layout instructions (method, scale, anchor, overrides)
+- `LayoutStrategy`: AI-generated layout instructions (method, scale, anchor, per-layer overrides)
+- `LayerOverride`: Per-layer transform with `scaleX`/`scaleY` (non-uniform), `edgeAnchor` (edge pinning for UI), and `layoutRole` (flow/static/overlay/background)
 - `ContainerDefinition`: Template container with absolute and normalized bounds
 
 ### PSD Template Convention
@@ -171,10 +172,19 @@ Layout strategies include confidence triangulation (`TriangulationAudit`) with v
 - **Single AI provider**: Qwen local only (model configured via `VITE_QWEN_MODEL` env var, no UI selector)
 - Server health indicator for Ollama connections (checking/online/offline)
 - Multi-instance support for parallel container analysis
-- Generates `LayoutStrategy` with: method (GEOMETRIC/GENERATIVE/HYBRID), spatial layout, scale, overrides
+- **3-Stage AI Pipeline:**
+  - Stage 1 (Source Comprehension): Semantic understanding of source content (narrative, elements, arrangement)
+  - Stage 2 (Layout Generation): Per-layer layout strategy with role-based scaling
+  - Stage 3 (Semantic Verification): Cross-checks layout preserves original composition intent
+- Generates `LayoutStrategy` with: method (GEOMETRIC/GENERATIVE/HYBRID), spatial layout, per-layer overrides
+- **Per-layer override generation:** AI must produce an override for EVERY layer, classifying each by semantic role:
+  - `background`: Stretch to fill target (non-uniform `scaleX`/`scaleY`)
+  - `flow`: Proportional positioning and uniform scaling
+  - `static`: Edge-pinned UI elements with `edgeAnchor` (horizontal/vertical pin)
+  - `overlay`: Positioned relative to parent via `linkedAnchorId`
+- **Override validation:** If AI misses layers, `inferLayoutRoleFromName()` generates sensible defaults based on layer name patterns (bg→background, win/counter→static, etc.)
 - Confidence triangulation via visual, knowledge, and metadata vectors
 - Knowledge integration: scopes rules per container, respects mute toggle
-- Extracts semantic anchors for content preservation
 - Draft generation disabled (requires ComfyUI integration)
 - **Token optimization for local models:**
   - Depth-limited layer flattening (`MAX_LAYER_DEPTH=3`) prevents token explosion on nested containers
@@ -191,10 +201,14 @@ Layout strategies include confidence triangulation (`TriangulationAudit`) with v
 - **Error handling:** Per-instance error state with user-visible error display in UI
 
 **RemapperNode** ([components/RemapperNode.tsx](components/RemapperNode.tsx)) - Transformation engine:
-- Applies geometric transforms from source to target bounds
-- Three spatial layout engines:
-  - `STRETCH_FILL`: Force-fit to container (backgrounds)
+- **Role-based per-layer transforms:** Each layer is transformed according to its `layoutRole`:
+  - `background`: Stretches to fill target container (independent X/Y scaling via `scaleX`/`scaleY`)
+  - `flow`: Proportional positioning - maintains relative position within container, uniform scale
+  - `static`: Edge pinning via `edgeAnchor` - UI elements maintain proportional distance from their pinned edges (left/center/right × top/center/bottom)
+  - `overlay`: Positioned relative to parent layer (uses `linkedAnchorId`), adjusted in physics pass
+- Base spatial layout engines provide fallback when no per-layer overrides exist:
   - `UNIFIED_FIT`: Aspect-preserving scale + center (default)
+  - `STRETCH_FILL`: Force-fit to container
   - `ABSOLUTE_PIN`: Explicit positioning via overrides
 - Physics solvers for semantic mode: grid distribution, collision prevention, overlay snapping, boundary clamping
 - Integrates feedback from DesignReviewer for iterative refinement

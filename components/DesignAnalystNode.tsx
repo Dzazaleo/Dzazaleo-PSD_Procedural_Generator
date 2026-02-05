@@ -905,6 +905,8 @@ Focus on UNDERSTANDING, not layout decisions.`;
                  'mustPreserve', 'canAdapt', 'canScale']
     };
 
+    console.log('[Analyst] Stage 1 Full Prompt:\n', comprehensionPrompt);
+
     const response = await generateCompletion({
       systemPrompt: 'You are a visual composition analyst. Analyze images deeply and output structured JSON.',
       messages: [{
@@ -1065,6 +1067,8 @@ Respond with JSON matching the VerificationResult schema.`;
       required: ['passed', 'narrativePreserved', 'hierarchyMaintained', 'allElementsVisible', 'issues', 'confidenceScore', 'verificationNotes']
     };
 
+    console.log('[Analyst] Stage 3 Full Prompt:\n', verificationPrompt);
+
     const response = await generateCompletion({
       systemPrompt: 'You are a design QA specialist verifying layout compositions. Output structured JSON.',
       messages: [{
@@ -1080,6 +1084,7 @@ Respond with JSON matching the VerificationResult schema.`;
     });
 
     const rawJson = response.json || {};
+    console.log('[Analyst] Stage 3 Full Response:', rawJson);
 
     return {
       passed: rawJson.passed ?? false,
@@ -1514,11 +1519,7 @@ Think step by step:
             sourceData.container.bounds.w,
             sourceData.container.bounds.h
           );
-          console.log('[Analyst] Source comprehension:', {
-            narrative: sourceAnalysis.narrative.substring(0, 100) + '...',
-            primaryElements: sourceAnalysis.primaryElements,
-            arrangement: sourceAnalysis.arrangement
-          });
+          console.log('[Analyst] Stage 1 Response (Source comprehension):', sourceAnalysis);
         }
 
         // ═══════════════════════════════════════════════════════════════════════════════
@@ -1529,7 +1530,7 @@ Think step by step:
         console.log('[Analyst] Stage 2: Layout Generation');
 
         const systemInstruction = generateSystemInstruction(sourceData, targetData, effectiveRules, effectiveKnowledge, sourceAnalysis);
-        console.log('[Analyst] System prompt length:', systemInstruction.length, 'chars');
+        console.log('[Analyst] Stage 2 System Prompt (' + systemInstruction.length + ' chars):\n', systemInstruction);
 
         // Build messages in provider-agnostic format
         const messages: { role: 'user' | 'assistant'; content: ContentPart[] }[] = [];
@@ -1678,6 +1679,13 @@ Think step by step:
                        'safetyReport', 'knowledgeApplied', 'directives', 'replaceLayerId']
         };
 
+        // Log Stage 2 user messages (text parts only, images omitted for readability)
+        console.log('[Analyst] Stage 2 User Messages:', messages.map(m => ({
+            role: m.role,
+            textParts: m.content.filter(c => c.type === 'text').map(c => (c as any).text),
+            imageCount: m.content.filter(c => c.type === 'image_url').length
+        })));
+
         // Call unified AI provider
         const response = await generateCompletion({
             systemPrompt: systemInstruction,
@@ -1814,10 +1822,8 @@ Think step by step:
         
         if (isMuted) json.knowledgeMuted = true;
 
-        // Debug: Log new prompt engineering fields
-        console.log('[Analyst] Response - visualAnalysis length:', json.visualAnalysis?.length || 0);
-        console.log('[Analyst] Response - rulesApplied count:', json.rulesApplied?.length || 0);
-        console.log('[Analyst] Response - overrides count:', json.overrides?.length || 0);
+        // Debug: Log full Stage 2 response
+        console.log('[Analyst] Stage 2 Full Response:', json);
 
         // ═══════════════════════════════════════════════════════════════════════════════
         // STAGE 3: SEMANTIC VERIFICATION

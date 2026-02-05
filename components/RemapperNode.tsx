@@ -752,8 +752,12 @@ export const RemapperNode = memo(({ id, data }: NodeProps<PSDNodeData>) => {
                                     // Use AI-specified absolute position
                                     finalX = targetRect.x + override.xOffset;
                                     finalY = targetRect.y + override.yOffset;
+                                } else if (!isSemanticMode) {
+                                    // GEOMETRIC MODE: Uniform-fit + center (preserve exact spatial relationships)
+                                    finalX = targetRect.x + baseOffsetX + localX * baseXScale;
+                                    finalY = targetRect.y + baseOffsetY + localY * baseYScale;
                                 } else {
-                                    // Calculate proportional position (element center stays at same relative position)
+                                    // SEMANTIC MODE: Proportional mapping (AI physics engine handles adjustments)
                                     finalX = targetRect.x + relativeX * targetRect.w;
                                     finalY = targetRect.y + relativeY * targetRect.h;
                                 }
