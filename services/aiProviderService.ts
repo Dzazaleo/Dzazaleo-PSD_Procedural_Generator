@@ -3,7 +3,7 @@
 /**
  * AI Provider Service
  *
- * Abstraction layer for AI inference providers (Gemini, Qwen2.5-VL via Ollama, etc.)
+ * Abstraction layer for AI inference providers (Qwen3-VL via Ollama, etc.)
  * Allows switching between cloud and local models without changing node code.
  */
 
@@ -54,11 +54,11 @@ export interface GenerateResult {
 }
 
 // Default configuration - can be overridden via environment variables
-// Note: minicpm-v:8b is used as the default because qwen2.5vl:7b crashes with images
+// qwen3-vl:8b — best quality/VRAM ratio on RTX 3090 Ti (24GB), ~6.1GB weights leaves ~18GB headroom
 const DEFAULT_CONFIG: AIProviderConfig = {
   provider: (import.meta.env.VITE_AI_PROVIDER as AIProvider) || 'qwen-local',
   baseUrl: import.meta.env.VITE_QWEN_BASE_URL || 'http://localhost:11434/v1',
-  model: import.meta.env.VITE_QWEN_MODEL || 'minicpm-v:8b',
+  model: import.meta.env.VITE_QWEN_MODEL || 'qwen3-vl:8b',
   comfyuiUrl: import.meta.env.VITE_COMFYUI_URL || 'http://127.0.0.1:8188',
 };
 
@@ -72,11 +72,10 @@ export function getAIProviderConfig(): AIProviderConfig {
   return { ...currentConfig };
 }
 
-// Maximum image dimension for local vision models (reduces VRAM usage)
-// 768px provides better detail for text/UI recognition at ~2x VRAM cost vs 512
-const MAX_IMAGE_DIMENSION = 768;
+// Maximum image dimension — 8B model has ample VRAM; 1024px for best detail
+const MAX_IMAGE_DIMENSION = 1024;
 
-// Maximum number of images per request (Ollama 0.12.x handles this well)
+// Maximum images per request — 8B model has ample VRAM for multi-image requests
 const MAX_IMAGES_PER_REQUEST = 8;
 
 /**
@@ -106,9 +105,9 @@ async function downscaleImageForOllama(dataUrl: string): Promise<string> {
     }
 
     // Calculate new dimensions maintaining aspect ratio
-    // CRITICAL: Qwen2.5-VL GGML requires dimensions divisible by 28 (2×patch_size)
-    // The error "a->ne[2] * 4 == b->ne[0]" indicates attention head dimension mismatch
-    const PATCH_SIZE = 28;
+    // CRITICAL: Qwen3-VL requires dimensions divisible by 32 (2×patch_size=16)
+    // Wrong alignment causes GGML tensor assertion failures
+    const PATCH_SIZE = 32;
     const scale = Math.min(MAX_IMAGE_DIMENSION / width, MAX_IMAGE_DIMENSION / height);
     let newWidth = Math.round(width * scale / PATCH_SIZE) * PATCH_SIZE || PATCH_SIZE;
     let newHeight = Math.round(height * scale / PATCH_SIZE) * PATCH_SIZE || PATCH_SIZE;
@@ -276,7 +275,7 @@ function repairTruncatedJson(text: string): any | null {
 }
 
 /**
- * Generate completion using Qwen2.5-VL via Ollama (OpenAI-compatible API)
+ * Generate completion using Qwen3-VL via Ollama (OpenAI-compatible API)
  */
 async function generateWithQwenLocal(options: GenerateOptions): Promise<GenerateResult> {
   const { baseUrl, model } = currentConfig;
@@ -317,11 +316,12 @@ async function generateWithQwenLocal(options: GenerateOptions): Promise<Generate
     model: model,
     messages: messages,
     max_tokens: options.maxTokens || 4096,
-    temperature: options.temperature ?? 0.7,
-    // Ollama-specific: increase context window (default is only 2048)
-    // 16384 provides good context for complex layout analysis
+    temperature: options.temperature ?? 0.4,
+    // Ollama-specific: 8B model (~6.1GB) leaves ~18GB headroom on 24GB GPU
+    // 32768 context needed because Qwen3's thinking tokens consume max_tokens budget —
+    // complex prompts can use 5000-8000 thinking tokens before producing JSON output
     options: {
-      num_ctx: 16384
+      num_ctx: 32768
     }
   };
 
@@ -371,7 +371,9 @@ async function generateWithQwenLocal(options: GenerateOptions): Promise<Generate
   }
 
   const data = await response.json();
-  const text = data.choices?.[0]?.message?.content || '';
+  let text = data.choices?.[0]?.message?.content || '';
+  // Strip Qwen3's <think>...</think> tags if they leak into content (safety net)
+  text = text.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
 
   // Try to parse as JSON if schema was provided
   let json: any = undefined;

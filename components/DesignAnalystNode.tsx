@@ -20,8 +20,8 @@ import { Psd } from 'ag-psd';
 // Layout/Analysis Constants
 const ASPECT_RATIO_TOLERANCE = 0.15;
 const HEALTH_CHECK_INTERVAL_MS = 30000;
+// 8B model with 16K context: generous layer coverage
 const MAX_LAYER_DEPTH = 3;
-// Layer count for prompt context - provides good coverage of container contents
 const MAX_LAYERS_IN_PROMPT = 20;
 const DRAFT_DEBOUNCE_MS = 500;
 
@@ -45,7 +45,7 @@ type ModelKey = 'qwen-local';
 const MODELS: Record<ModelKey, { badgeClass: string; label: string }> = {
   'qwen-local': {
     badgeClass: 'bg-cyan-900/30 border-cyan-500/30 text-cyan-300',
-    label: 'QWEN LOCAL'
+    label: 'QWEN3 8B'
   }
 };
 
@@ -1003,7 +1003,7 @@ Focus on UNDERSTANDING, not layout decisions.`;
         ]
       }],
       responseSchema: sourceAnalysisSchema,
-      maxTokens: 2048,
+      maxTokens: 4096,  // Qwen3 thinking tokens consume max_tokens budget; 4K gives headroom
       temperature: 0.3
     });
 
@@ -1130,7 +1130,7 @@ Output JSON: { "passed": bool, "issues": [...], "correctedOverrides": [...] (if 
         ]
       }],
       responseSchema: verificationSchema,
-      maxTokens: 2048,
+      maxTokens: 4096,  // Qwen3 thinking tokens consume max_tokens budget; 4K gives headroom
       temperature: 0.2
     });
 
@@ -1636,7 +1636,7 @@ Think: 1) What's here? 2) How to arrange in ${targetW}x${targetH}? 3) What scale
             systemPrompt: systemInstruction,
             messages,
             responseSchema,
-            maxTokens: 8192,
+            maxTokens: 16384,  // Qwen3 thinking tokens consume max_tokens budget; complex layout needs 16K
             temperature: 0.7
         });
 
@@ -2260,13 +2260,13 @@ Think: 1) What's here? 2) How to arrange in ${targetW}x${targetH}? 3) What scale
                     </span>
                 )}
              </div>
-             <span className="text-[9px] text-purple-400 max-w-[200px] truncate">{titleSuffix}</span>
+             <span className="text-[9px] text-cyan-400 max-w-[200px] truncate">{titleSuffix}</span>
            </div>
          </div>
          {/* Server Status Indicator */}
          <div className="flex items-center space-x-2">
            <span className="text-[9px] px-2 py-1 rounded font-mono font-bold tracking-wider border flex items-center gap-1.5 bg-cyan-900/30 border-cyan-500/30 text-cyan-300">
-             QWEN LOCAL
+             QWEN3 8B
              <span className={`w-2 h-2 rounded-full ${
                serverStatus === 'checking' ? 'bg-yellow-400 animate-pulse' :
                serverStatus === 'online' ? 'bg-emerald-400 shadow-[0_0_4px_#10b981]' :

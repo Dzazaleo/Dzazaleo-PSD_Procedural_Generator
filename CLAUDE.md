@@ -53,12 +53,14 @@ LoadPSD → DesignInfo/TemplateSplitter → ContainerResolver → DesignAnalyst 
 
 **AI Provider Service** ([services/aiProviderService.ts](services/aiProviderService.ts)) - Qwen/Ollama AI abstraction:
 - `generateCompletion()`: Unified interface for text/vision inference with structured JSON output
-- Uses Ollama with local vision-language models (e.g., `qwen2.5vl:7b`, `minicpm-v:8b`)
-- **Requires Ollama 0.12.11** - newer versions (0.13.x+) have GGML tensor bugs with vision models
-- Automatic image downscaling for local models (max 512px, aligned to 28px patch size)
+- Uses Ollama with local vision-language models (default: `qwen3-vl:8b`, fallback: `qwen2.5vl:7b`)
+- **Requires Ollama 0.12.7+** (tested on 0.12.11)
+- Automatic image downscaling for local models (max 1024px, aligned to 32px patch size for Qwen3-VL)
 - Supports up to 8 images per request (`MAX_IMAGES_PER_REQUEST=8`)
-- Large context window for complex analysis (`num_ctx: 16384`)
-- JSON response parsing with markdown code fence stripping
+- Large context window (`num_ctx: 32768`) — needed because Qwen3's thinking tokens consume the `max_tokens` (= `num_predict`) budget on Ollama
+- Qwen3 thinking mode handled automatically: JSON mode separates thinking into `reasoning` field; `<think>` tag stripping as safety net
+- **Token budget for thinking:** Qwen3's thinking tokens consume the `max_tokens` budget on Ollama, so all stage `maxTokens` values account for 2-8K thinking overhead (see DesignAnalystNode section for per-stage values)
+- JSON response parsing with markdown code fence stripping and truncation repair
 - Health checks for local servers via `checkQwenServerHealth()`
 - Debug logging for Qwen requests (model, image count, text length)
 
@@ -87,14 +89,14 @@ PSD files use a `!!TEMPLATE` top-level group containing container definitions. C
 ### AI Integration
 
 **AI Provider Service** ([services/aiProviderService.ts](services/aiProviderService.ts)) - Qwen/Ollama AI backend:
-- `qwen-local`: Ollama with local vision-language models (e.g., `minicpm-v:8b`, `qwen2.5vl:7b`)
+- `qwen-local`: Ollama with local vision-language models (default: `qwen3-vl:8b`)
 
 #### Environment Configuration (`.env.local`)
 
 ```bash
 # Qwen Local (Ollama) configuration
 VITE_QWEN_BASE_URL=http://localhost:11434/v1
-VITE_QWEN_MODEL=qwen2.5vl:7b  # Recommended for best reasoning quality
+VITE_QWEN_MODEL=qwen3-vl:8b  # Best quality/VRAM ratio for 24GB GPU
 
 # ComfyUI (optional, for draft generation - currently disabled)
 VITE_COMFYUI_URL=http://127.0.0.1:8188
@@ -102,17 +104,20 @@ VITE_COMFYUI_URL=http://127.0.0.1:8188
 
 #### Ollama Setup
 
-**IMPORTANT: Use Ollama 0.12.11** - versions 0.13.x+ have GGML tensor bugs with vision models.
+**Requires Ollama 0.12.7+** (tested on 0.12.11). Qwen3-VL architecture support was added in 0.12.7.
 
-1. Download Ollama 0.12.11: https://github.com/ollama/ollama/releases/download/v0.12.11/OllamaSetup.exe
-2. Install and verify: `ollama --version` should show `0.12.11`
-3. Pull the vision model: `ollama pull qwen2.5vl:7b` (requires ~17GB VRAM)
+1. Install Ollama: https://ollama.com/download/windows
+2. Verify version: `ollama --version` (should show 0.12.7 or later)
+3. Pull the vision model: `ollama pull qwen3-vl:8b` (~6.1GB download, ~8GB VRAM during inference)
 
 **Model Options** (configured via `VITE_QWEN_MODEL` in `.env.local`):
-- `qwen2.5vl:7b`: **Recommended** - Superior reasoning for complex layouts, works reliably on Ollama 0.12.11
-- `minicpm-v:8b`: Alternative vision model, lower VRAM requirements (~8GB)
+- `qwen3-vl:8b`: **Recommended** — Newest architecture, best quality/VRAM ratio (~6.1GB weights, ~18GB headroom on 24GB GPU)
+- `qwen2.5vl:7b`: Legacy fallback (~6GB weights)
+- `minicpm-v:8b`: Lightweight alternative (~5.5GB weights)
 
 **Note:** Model selection is configured via environment variable only. The UI displays the current model but does not provide a selector.
+
+**Qwen3-VL Thinking Mode:** Qwen3 models emit `<think>...</think>` reasoning by default. In JSON mode (used by all 3 pipeline stages), thinking goes to a separate `reasoning` field and `content` contains clean JSON. The code also strips `<think>` tags as a safety net.
 
 #### AI Features
 
@@ -197,6 +202,14 @@ Layout strategies include confidence triangulation (`TriangulationAudit`) with v
 - Confidence triangulation via visual, knowledge, and metadata vectors
 - Knowledge integration: scopes rules per container, respects mute toggle
 - Draft generation disabled (requires ComfyUI integration)
+- **Token budget (accounts for Qwen3 thinking overhead):**
+  - Ollama maps `max_tokens` → `num_predict`, which caps ALL output tokens (thinking + JSON content)
+  - Qwen3-VL uses 2000-8000 thinking tokens before producing JSON, depending on prompt complexity
+  - Stage 1 `maxTokens: 4096` — simple analysis, moderate thinking
+  - Stage 2 `maxTokens: 16384` — complex layout reasoning, heavy thinking
+  - Stage 3 `maxTokens: 4096` — verification, moderate thinking
+  - `num_ctx: 32768` in `aiProviderService.ts` ensures input + output fit within context window
+  - If JSON responses are still truncated, increase `maxTokens` in the relevant `generateCompletion()` call
 - **Token optimization for local models:**
   - Depth-limited layer flattening (`MAX_LAYER_DEPTH=3`) prevents token explosion on nested containers
   - Layer sample capped at `MAX_LAYERS_IN_PROMPT=20` for comprehensive container coverage
@@ -292,29 +305,25 @@ Layout strategies include confidence triangulation (`TriangulationAudit`) with v
 
 #### Local Ollama Issues
 
-**"GGML_ASSERT(a->ne[2] * 4 == b->ne[0]) failed" errors with qwen2.5vl:**
+**GGML tensor errors with vision models:**
 
-This is a **known regression in Ollama 0.13.x+** affecting Qwen2.5-VL vision models. The error occurs during RoPE (Rotary Position Embedding) tensor operations when the KV cache is shifted.
+Image dimensions must be aligned to the model's patch size. Qwen3-VL requires dimensions divisible by 32 (`PATCH_SIZE=32` in `aiProviderService.ts`). If you see GGML assertion failures, verify the downscaling code is producing correctly aligned dimensions (check browser console for `[aiProviderService] Downscaled image` logs).
 
-**Solution: Use Ollama 0.12.11**
-
-```powershell
-# Download and install Ollama 0.12.11
-Invoke-WebRequest -Uri "https://github.com/ollama/ollama/releases/download/v0.12.11/OllamaSetup.exe" -OutFile "$env:TEMP\OllamaSetup-0.12.11.exe"
-Start-Process "$env:TEMP\OllamaSetup-0.12.11.exe" -Wait
-
-# Verify version
-ollama --version  # Should show 0.12.11
-```
-
-With Ollama 0.12.11, qwen2.5vl:7b works reliably with full inference limits (512px images, 8 images/request, 16384 context, 20 layers/prompt).
-
-**If you must use Ollama 0.13.x+:** reduce `MAX_IMAGE_DIMENSION` to 384, `MAX_IMAGES_PER_REQUEST` to 2, `num_ctx` to 8192, and `MAX_LAYERS_IN_PROMPT` to 12 in the code.
+**Ollama version requirements:**
+- `qwen3-vl:8b`: Requires Ollama 0.12.7+ (architecture support added in that version)
+- `qwen2.5vl:7b`: Works on any Ollama version, but 0.13.x+ may have GGML bugs
 
 **Ollama server debugging:**
 ```powershell
 $env:OLLAMA_DEBUG="1"; ollama serve
 ```
+
+**Qwen3 thinking mode issues:**
+- All 3 pipeline stages use JSON mode (`response_format: {type: "json_object"}`), which correctly separates thinking into a `reasoning` field
+- The `content` field contains clean JSON output
+- `<think>` tag stripping in `aiProviderService.ts` acts as a safety net
+- `think: false` API parameter does NOT work on Ollama 0.12.11 — not relied upon
+- **CRITICAL: Thinking tokens consume `max_tokens` budget.** Ollama maps `max_tokens` to `num_predict`, which limits ALL generated tokens (thinking + content). Complex prompts need 2-4x the naive token estimate. If JSON responses are truncated, increase `maxTokens` in the `generateCompletion()` calls and ensure `num_ctx` >= input_tokens + max_tokens.
 
 **Analysis failures:**
 - DesignAnalystNode displays error messages directly in the UI (red banner below chat)
