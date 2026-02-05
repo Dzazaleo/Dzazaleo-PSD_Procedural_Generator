@@ -888,7 +888,8 @@ export const DesignAnalystNode = memo(({ id, data }: NodeProps<PSDNodeData>) => 
     sourceImage: string,
     containerName: string,
     sourceW: number,
-    sourceH: number
+    sourceH: number,
+    visibleLayerCount?: number
   ): Promise<SourceAnalysis> => {
     const comprehensionPrompt = `You are an expert visual analyst. Your task is to deeply understand this design composition BEFORE any layout decisions are made.
 
@@ -949,7 +950,7 @@ Look for:
 These pairs MUST stay together when the layout changes. A label separated from its object loses meaning.
 
 CONTEXT:
-Container: "${containerName}" (${sourceW}x${sourceH}px)
+Container: "${containerName}" (${sourceW}x${sourceH}px)${visibleLayerCount ? `\nThis container has ${visibleLayerCount} visible content layers. Use this count to verify your element identification — make sure you identify ALL of them.` : ''}
 
 OUTPUT FORMAT:
 Respond with a JSON object matching the SourceAnalysis schema.
@@ -1044,9 +1045,10 @@ Focus on UNDERSTANDING, not layout decisions.`;
       ? `\nLAYER DIMENSIONS (for coordinate validation):\n${sourceLayers.map(l => `${l.id} ${l.name}: ${l.coords.w}x${l.coords.h} at (${l.coords.x},${l.coords.y})`).join('\n')}\n`
       : '';
 
-    // Compact override summary (only key fields to save tokens)
+    // Compact override summary (only key fields to save tokens) — include layer names for cross-referencing
+    const layerNameMap = new Map((sourceLayers || []).map(l => [l.id, l.name]));
     const overrideSummary = (layoutStrategy.overrides || []).map(o =>
-      `${o.layerId}: role=${o.layoutRole}, pos=(${Math.round(o.xOffset)},${Math.round(o.yOffset)}), scale=${o.individualScale?.toFixed(2) || '1.00'}${o.scaleX ? ` scaleXY=(${o.scaleX.toFixed(2)},${o.scaleY?.toFixed(2)})` : ''}`
+      `${o.layerId} (${layerNameMap.get(o.layerId) || '?'}): role=${o.layoutRole}, pos=(${Math.round(o.xOffset)},${Math.round(o.yOffset)}), scale=${o.individualScale?.toFixed(2) || '1.00'}${o.scaleX ? ` scaleXY=(${o.scaleX.toFixed(2)},${o.scaleY?.toFixed(2)})` : ''}`
     ).join('\n');
 
     const verificationPrompt = `You are a design QA specialist verifying a layout preserves the original composition.
@@ -1066,7 +1068,10 @@ VERIFY (YES/NO each):
 4. Visual balance? Evenly distributed?
 5. Scale appropriate? Text readable?
 
-IF ISSUES: Provide correctedOverrides with ABSOLUTE xOffset/yOffset (from target top-left 0,0).
+IF ANY CHECK FAILS (passed=false), you MUST populate "correctedOverrides" — do NOT leave it empty.
+For each corrected override: { layerId, xOffset, yOffset, individualScale, layoutRole }
+An empty correctedOverrides with passed=false is INVALID output.
+Provide correctedOverrides with ABSOLUTE xOffset/yOffset (from target top-left 0,0).
 All coordinates must be >= 0 and fit within ${targetW}x${targetH}.
 
 Output JSON: { "passed": bool, "issues": [...], "correctedOverrides": [...] (if needed), "confidenceScore": 0-1 }`;
@@ -1305,6 +1310,7 @@ VISUAL ANCHORS: ${effectiveKnowledge.visualAnchors.length} reference image(s) fo
     }).join('\n');
     const layerDataSection = `
 LAYERS (${layerAnalysisData.length} total, showing ${Math.min(MAX_LAYERS_IN_PROMPT, layerAnalysisData.length)}):
+CRITICAL: Use ONLY the first column (ID) as "layerId" in overrides. Do NOT use the Name column.
 [HIDDEN] = invisible layer (skip or minimal override). "near:ID" = spatially overlaps that layer.
 ID | Name | RelX,RelY | WxH | Type
 ${layerRows}
@@ -1333,6 +1339,7 @@ Source ${sourceW}x${sourceH} → Target ${targetW}x${targetH}
 Proportional scale: ${proportionalScale.toFixed(3)}
 
 Each override MUST have: layerId, layoutRole, xOffset, yOffset, individualScale.
+layerId MUST be the ID from the first column of the layer table (e.g. "1.0", "1.8"), NOT the layer name.
 Missing layers = INVALID OUTPUT.
 `;
 
@@ -1424,6 +1431,23 @@ Think: 1) What's here? 2) How to arrange in ${targetW}x${targetH}? 3) What scale
         const sourcePixelsBase64 = await extractSourcePixels(sourceData.layers as SerializableLayer[], sourceData.container.bounds);
         const base64Clean = sourcePixelsBase64 ? sourcePixelsBase64.split(',')[1] : '';
 
+        // --- Reusable layer flattener (used by reconciliation, fallback defaults, and Stage 1 count) ---
+        const flattenLayerIds = (layers: SerializableLayer[], depth = 0, maxDepth = MAX_LAYER_DEPTH): { id: string; name: string; coords: any; isVisible: boolean; }[] => {
+            if (depth > maxDepth) return [];
+            let result: { id: string; name: string; coords: any; isVisible: boolean; }[] = [];
+            for (const layer of layers) {
+                if (layer.type === 'layer' || depth <= 1) {
+                    result.push({ id: layer.id, name: layer.name, coords: layer.coords, isVisible: layer.isVisible !== false });
+                }
+                if (layer.children && depth < maxDepth) {
+                    result = result.concat(flattenLayerIds(layer.children, depth + 1, maxDepth));
+                }
+            }
+            return result;
+        };
+        const allLayers = flattenLayerIds(sourceData.layers as SerializableLayer[]);
+        const visibleLayerCount = allLayers.filter(l => l.isVisible).length;
+
         // ═══════════════════════════════════════════════════════════════════════════════
         // STAGE 1: SOURCE COMPREHENSION
         // Deep understanding of the source composition before any layout decisions
@@ -1436,7 +1460,8 @@ Think: 1) What's here? 2) How to arrange in ${targetW}x${targetH}? 3) What scale
             base64Clean,
             sourceData.container.containerName,
             sourceData.container.bounds.w,
-            sourceData.container.bounds.h
+            sourceData.container.bounds.h,
+            visibleLayerCount
           );
           console.log('[Analyst] Stage 1 Response (Source comprehension):', sourceAnalysis);
         }
@@ -1642,23 +1667,97 @@ Think: 1) What's here? 2) How to arrange in ${targetW}x${targetH}? 3) What scale
             knowledgeMuted: false,
         };
 
-        // --- PER-LAYER OVERRIDE VALIDATION ---
-        // Ensure every layer has an override (generate defaults for missing layers)
-        const flattenLayerIds = (layers: SerializableLayer[], depth = 0, maxDepth = MAX_LAYER_DEPTH): { id: string; name: string; coords: any; isVisible: boolean; }[] => {
-            if (depth > maxDepth) return [];
-            let result: { id: string; name: string; coords: any; isVisible: boolean; }[] = [];
-            for (const layer of layers) {
-                if (layer.type === 'layer' || depth <= 1) {
-                    result.push({ id: layer.id, name: layer.name, coords: layer.coords, isVisible: layer.isVisible !== false });
-                }
-                if (layer.children && depth < maxDepth) {
-                    result = result.concat(flattenLayerIds(layer.children, depth + 1, maxDepth));
+        // --- NAME-TO-ID RECONCILIATION (Step 2) ---
+        // AI sometimes uses layer NAMES as layerId instead of actual path IDs.
+        // Partition overrides: id-based (valid) vs orphaned (layerId not in allLayers).
+        // Resolve orphans via name matching, merge semantic fields over positional ones.
+        {
+            const idSet = new Set(allLayers.map(l => l.id));
+            const nameToLayers = new Map<string, { id: string; name: string }[]>();
+            for (const l of allLayers) {
+                const existing = nameToLayers.get(l.name) || [];
+                existing.push({ id: l.id, name: l.name });
+                nameToLayers.set(l.name, existing);
+            }
+            // Case-insensitive index (only unique lower-case names)
+            const lowerNameToLayers = new Map<string, { id: string; name: string }[]>();
+            for (const l of allLayers) {
+                const key = l.name.toLowerCase();
+                const existing = lowerNameToLayers.get(key) || [];
+                existing.push({ id: l.id, name: l.name });
+                lowerNameToLayers.set(key, existing);
+            }
+
+            const idBasedMap = new Map<string, LayerOverride>();
+            const orphaned: LayerOverride[] = [];
+            for (const ov of json.overrides as LayerOverride[]) {
+                if (idSet.has(ov.layerId)) {
+                    idBasedMap.set(ov.layerId, ov);
+                } else {
+                    orphaned.push(ov);
                 }
             }
-            return result;
-        };
 
-        const allLayers = flattenLayerIds(sourceData.layers as SerializableLayer[]);
+            let remapped = 0, merged = 0, discarded = 0;
+            for (const ov of orphaned) {
+                let resolvedId: string | null = null;
+                // Try exact name match (unique names only)
+                const exactMatch = nameToLayers.get(ov.layerId);
+                if (exactMatch && exactMatch.length === 1) {
+                    resolvedId = exactMatch[0].id;
+                }
+                // Fallback: case-insensitive name match (unique only)
+                if (!resolvedId) {
+                    const ciMatch = lowerNameToLayers.get(ov.layerId.toLowerCase());
+                    if (ciMatch && ciMatch.length === 1) {
+                        resolvedId = ciMatch[0].id;
+                    }
+                }
+
+                if (resolvedId) {
+                    const existing = idBasedMap.get(resolvedId);
+                    if (existing) {
+                        // Merge: keep ID-based positional fields, take name-based semantic fields
+                        if (ov.layoutRole) existing.layoutRole = ov.layoutRole;
+                        if (ov.edgeAnchor) existing.edgeAnchor = ov.edgeAnchor;
+                        if (ov.linkedAnchorId) existing.linkedAnchorId = ov.linkedAnchorId;
+                        if (ov.citedRule) existing.citedRule = ov.citedRule;
+                        merged++;
+                    } else {
+                        // Remap: use real ID, keep all fields
+                        ov.layerId = resolvedId;
+                        idBasedMap.set(resolvedId, ov);
+                        remapped++;
+                    }
+                } else {
+                    console.warn(`[Analyst] Discarding unresolvable override: layerId="${ov.layerId}" (not a valid ID or unique name)`);
+                    discarded++;
+                }
+            }
+
+            // Also reconcile linkedAnchorId fields that may reference names instead of IDs
+            for (const [, ov] of idBasedMap) {
+                if (ov.linkedAnchorId && !idSet.has(ov.linkedAnchorId)) {
+                    const anchorMatch = nameToLayers.get(ov.linkedAnchorId);
+                    if (anchorMatch && anchorMatch.length === 1) {
+                        ov.linkedAnchorId = anchorMatch[0].id;
+                    } else {
+                        const ciMatch = lowerNameToLayers.get(ov.linkedAnchorId.toLowerCase());
+                        if (ciMatch && ciMatch.length === 1) {
+                            ov.linkedAnchorId = ciMatch[0].id;
+                        }
+                    }
+                }
+            }
+
+            json.overrides = Array.from(idBasedMap.values());
+            if (remapped > 0 || merged > 0 || discarded > 0) {
+                console.log(`[Analyst] Override reconciliation: ${remapped} remapped, ${merged} merged, ${discarded} discarded`);
+            }
+        }
+
+        // --- PER-LAYER OVERRIDE VALIDATION ---
+        // Ensure every layer has an override (generate defaults for missing layers)
         const overrideLayerIds = new Set((json.overrides || []).map((o: LayerOverride) => o.layerId));
         const missingLayers = allLayers.filter(l => !overrideLayerIds.has(l.id));
 
