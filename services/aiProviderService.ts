@@ -73,8 +73,8 @@ export function getAIProviderConfig(): AIProviderConfig {
 }
 
 // Maximum image dimension for local vision models (reduces VRAM usage)
-// 512px provides good detail while keeping VRAM reasonable
-const MAX_IMAGE_DIMENSION = 512;
+// 768px provides better detail for text/UI recognition at ~2x VRAM cost vs 512
+const MAX_IMAGE_DIMENSION = 768;
 
 // Maximum number of images per request (Ollama 0.12.x handles this well)
 const MAX_IMAGES_PER_REQUEST = 8;

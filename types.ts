@@ -115,13 +115,19 @@ export interface LayerOverride {
   xOffset: number;
   yOffset: number;
   individualScale: number;
-  rotation?: number; 
-  citedRule?: string; 
-  anchorIndex?: number; 
-  
+  scaleX?: number;          // Independent X scale (overrides individualScale for non-uniform scaling)
+  scaleY?: number;          // Independent Y scale (overrides individualScale for non-uniform scaling)
+  rotation?: number;
+  citedRule?: string;
+  anchorIndex?: number;
+
   // Phase 4D: Semantic Physics
-  layoutRole?: 'flow' | 'static' | 'overlay' | 'background'; 
+  layoutRole?: 'flow' | 'static' | 'overlay' | 'background';
   linkedAnchorId?: string; // ID of the parent layer this overlay attaches to
+  edgeAnchor?: {           // For static/UI elements: which edges to pin to
+    horizontal: 'left' | 'center' | 'right';
+    vertical: 'top' | 'center' | 'bottom';
+  };
 }
 
 // --- PHASE 5: SEMANTIC TRIANGULATION ---
@@ -176,9 +182,62 @@ export interface LayoutStrategy {
   };
 }
 
+// --- PHASE 2: 3-STAGE SEMANTIC PIPELINE ---
+export interface SourceAnalysis {
+  // Narrative understanding
+  narrative: string;           // What story/purpose does this convey?
+  userExperience: string;      // What is the user supposed to do/feel?
+
+  // Element identification
+  primaryElements: string[];   // Main characters/objects (e.g., ["potion_red", "potion_blue", "potion_green"])
+  secondaryElements: string[]; // Supporting elements (e.g., ["title_text", "prize_labels"])
+  backgroundElements: string[];// Background/decorative (e.g., ["library_bg", "cobwebs"])
+
+  // Visual hierarchy
+  attentionOrder: string[];    // What draws the eye: 1st, 2nd, 3rd... (e.g., ["potions", "title", "prizes"])
+  dominantElement: string;     // Single most important element
+
+  // Spatial rationale
+  arrangement: string;         // How elements are arranged (e.g., "3 potions in triangular formation")
+  arrangementRationale: string;// WHY this arrangement (e.g., "Triangle creates stable, balanced choice presentation")
+  keyRelationships: string[];  // Spatial relationships that matter (e.g., ["potions equidistant", "title above choices"])
+
+  // Preservation priorities (ordered)
+  mustPreserve: string[];      // What MUST be maintained (e.g., ["all 3 choices visible", "equal visual weight"])
+  canAdapt: string[];          // What can be rearranged (e.g., ["potion formation", "spacing"])
+  canScale: string[];          // What can be scaled down (e.g., ["prize labels", "decorative elements"])
+}
+
+export interface VerificationIssue {
+  type: 'missing_element' | 'hierarchy_violation' | 'balance_issue' | 'cropping' | 'other';
+  description: string;
+  suggestedFix: string;
+}
+
+export interface VerificationResult {
+  passed: boolean;
+
+  // Semantic checks
+  narrativePreserved: boolean;
+  hierarchyMaintained: boolean;
+  allElementsVisible: boolean;
+
+  // Specific issues (if any)
+  issues: VerificationIssue[];
+
+  // If failed, provide corrected strategy
+  correctedOverrides?: LayerOverride[];
+  correctedScale?: number;
+
+  // Confidence
+  confidenceScore: number; // 0-1
+  verificationNotes: string;
+}
+// ----------------------------------------
+
 export interface ReviewerStrategy {
-    CARO_Audit: string; 
-    overrides: LayerOverride[]; 
+    CARO_Audit: string;
+    overrides: LayerOverride[];
 }
 
 // --- FEEDBACK LOOP ---

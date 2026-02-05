@@ -654,62 +654,130 @@ export const RemapperNode = memo(({ id, data }: NodeProps<PSDNodeData>) => {
                     const getOverride = (id: string) => strategy?.overrides?.find(o => o.layerId === id);
 
                     let transformed: TransformedLayer[] = layers.map((layer, idx) => {
-                        // 1. Normalize to Source Origin (Local Space)
-                        const localX = layer.coords.x - sourceRect.x;
-                        const localY = layer.coords.y - sourceRect.y;
-                        
-                        // 2. Apply Engine Transform (Geometric Baseline)
-                        const geomX = targetRect.x + baseOffsetX + (localX * baseXScale);
-                        const geomY = targetRect.y + baseOffsetY + (localY * baseYScale);
-                        
-                        // 3. Apply Overrides (ABSOLUTE_PIN logic integrated here)
-                        let finalX = geomX + parentDeltaX;
-                        let finalY = geomY + parentDeltaY;
-                        let layerScaleX = baseXScale; // Inherit base scale
-                        let layerScaleY = baseYScale;
-                        
+                        // Handle generative replacement first
                         if (effectiveAllowed && strategy?.replaceLayerId === layer.id) {
                             return {
                                 ...layer,
-                                type: 'generative', 
-                                generativePrompt: strategy.generativePrompt, 
-                                coords: { x: targetRect.x, y: targetRect.y, w: targetRect.w, h: targetRect.h }, 
+                                type: 'generative',
+                                generativePrompt: strategy.generativePrompt,
+                                coords: { x: targetRect.x, y: targetRect.y, w: targetRect.w, h: targetRect.h },
                                 transform: { scaleX: 1, scaleY: 1, offsetX: targetRect.x, offsetY: targetRect.y },
-                                children: undefined 
+                                children: undefined
                             };
                         }
-                        
-                        let override = getOverride(layer.id);
 
-                        if (override) {
-                            // If Absolute Pinning is active (implied by existence of override in Semantic Mode)
-                            // The Analyst gives us target-relative absolute offsets usually.
-                            // But here we treat them as modifications to the Engine result.
-                            
-                            // NOTE: Our Override inspector expects: finalX = targetRect.x + override.xOffset
-                            // So we apply the override as an absolute position relative to Target Top-Left
-                            
-                            finalX = targetRect.x + override.xOffset;
-                            finalY = targetRect.y + override.yOffset;
-                            
-                            // Overrides typically specify a uniform scale for the element
-                            if (override.individualScale) {
-                                layerScaleX = override.individualScale;
-                                layerScaleY = override.individualScale;
-                            }
+                        const override = getOverride(layer.id);
+                        const role = override?.layoutRole || 'flow';
+
+                        // Calculate layer's original position relative to source container
+                        const localX = layer.coords.x - sourceRect.x;
+                        const localY = layer.coords.y - sourceRect.y;
+                        const relativeX = localX / sourceW;  // 0-1 normalized position
+                        const relativeY = localY / sourceH;
+
+                        let finalX: number;
+                        let finalY: number;
+                        let layerScaleX: number;
+                        let layerScaleY: number;
+
+                        // --- ROLE-BASED TRANSFORM LOGIC ---
+                        switch (role) {
+                            case 'background':
+                                // STRETCH TO FILL: Independent X/Y scaling to fill entire target
+                                layerScaleX = override?.scaleX ?? (targetRect.w / Math.max(layer.coords.w, 1));
+                                layerScaleY = override?.scaleY ?? (targetRect.h / Math.max(layer.coords.h, 1));
+                                finalX = targetRect.x + (override?.xOffset ?? 0);
+                                finalY = targetRect.y + (override?.yOffset ?? 0);
+                                break;
+
+                            case 'static':
+                                // EDGE PINNING: Maintain relative edge distances
+                                const anchor = override?.edgeAnchor || { horizontal: 'center', vertical: 'center' };
+                                // Static elements typically don't scale much - maintain legibility
+                                layerScaleX = override?.scaleX ?? override?.individualScale ?? 1;
+                                layerScaleY = override?.scaleY ?? override?.individualScale ?? 1;
+
+                                const scaledLayerW = layer.coords.w * layerScaleX;
+                                const scaledLayerH = layer.coords.h * layerScaleY;
+
+                                // Calculate position based on edge anchor
+                                if (anchor.horizontal === 'left') {
+                                    // Maintain proportional distance from left
+                                    finalX = targetRect.x + localX * (targetRect.w / sourceW);
+                                } else if (anchor.horizontal === 'right') {
+                                    // Maintain proportional distance from right
+                                    const distFromRight = sourceW - (localX + layer.coords.w);
+                                    finalX = targetRect.x + targetRect.w - scaledLayerW - distFromRight * (targetRect.w / sourceW);
+                                } else { // center
+                                    finalX = targetRect.x + (targetRect.w - scaledLayerW) / 2;
+                                }
+
+                                if (anchor.vertical === 'top') {
+                                    finalY = targetRect.y + localY * (targetRect.h / sourceH);
+                                } else if (anchor.vertical === 'bottom') {
+                                    const distFromBottom = sourceH - (localY + layer.coords.h);
+                                    finalY = targetRect.y + targetRect.h - scaledLayerH - distFromBottom * (targetRect.h / sourceH);
+                                } else { // center
+                                    finalY = targetRect.y + (targetRect.h - scaledLayerH) / 2;
+                                }
+
+                                // Apply explicit offset if provided
+                                if (override?.xOffset !== undefined) {
+                                    finalX = targetRect.x + override.xOffset;
+                                }
+                                if (override?.yOffset !== undefined) {
+                                    finalY = targetRect.y + override.yOffset;
+                                }
+                                break;
+
+                            case 'overlay':
+                                // RELATIVE TO PARENT: Will be adjusted in physics pass
+                                // For now, use proportional positioning
+                                layerScaleX = override?.scaleX ?? override?.individualScale ?? baseXScale;
+                                layerScaleY = override?.scaleY ?? override?.individualScale ?? baseYScale;
+
+                                if (override?.xOffset !== undefined && override?.yOffset !== undefined) {
+                                    finalX = targetRect.x + override.xOffset;
+                                    finalY = targetRect.y + override.yOffset;
+                                } else {
+                                    finalX = targetRect.x + relativeX * targetRect.w;
+                                    finalY = targetRect.y + relativeY * targetRect.h;
+                                }
+                                break;
+
+                            case 'flow':
+                            default:
+                                // PROPORTIONAL: Maintain relative position, scale proportionally
+                                if (override?.xOffset !== undefined && override?.yOffset !== undefined) {
+                                    // Use AI-specified absolute position
+                                    finalX = targetRect.x + override.xOffset;
+                                    finalY = targetRect.y + override.yOffset;
+                                } else {
+                                    // Calculate proportional position (element center stays at same relative position)
+                                    finalX = targetRect.x + relativeX * targetRect.w;
+                                    finalY = targetRect.y + relativeY * targetRect.h;
+                                }
+                                // Use per-axis scale if provided, otherwise use individualScale or base
+                                layerScaleX = override?.scaleX ?? override?.individualScale ?? baseXScale;
+                                layerScaleY = override?.scaleY ?? override?.individualScale ?? baseYScale;
+                                break;
                         }
-                        
+
+                        // Apply parent delta for nested layers
+                        finalX += parentDeltaX;
+                        finalY += parentDeltaY;
+
                         const scaledW = layer.coords.w * layerScaleX;
                         const scaledH = layer.coords.h * layerScaleY;
 
                         return {
                             ...layer,
-                            layoutRole: override?.layoutRole,
+                            layoutRole: role,
                             linkedAnchorId: override?.linkedAnchorId,
                             citedRule: override?.citedRule,
                             coords: { x: finalX, y: finalY, w: scaledW, h: scaledH },
                             transform: { scaleX: layerScaleX, scaleY: layerScaleY, offsetX: finalX, offsetY: finalY },
-                            children: layer.children ? transformLayers(layer.children, depth + 1, parentDeltaX, parentDeltaY) : undefined
+                            children: layer.children ? transformLayers(layer.children, depth + 1, 0, 0) : undefined
                         };
                     });
 

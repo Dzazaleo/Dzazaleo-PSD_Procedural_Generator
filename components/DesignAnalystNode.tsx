@@ -3,7 +3,7 @@ import * as React from 'react';
 import { memo, useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { Handle, Position, NodeResizer, useEdges, useReactFlow, useUpdateNodeInternals, useNodes } from 'reactflow';
 import type { NodeProps, Node, Edge } from 'reactflow';
-import { PSDNodeData, LayoutStrategy, SerializableLayer, ChatMessage, AnalystInstanceState, ContainerContext, TemplateMetadata, ContainerDefinition, MappingContext, KnowledgeContext } from '../types';
+import { PSDNodeData, LayoutStrategy, SerializableLayer, ChatMessage, AnalystInstanceState, ContainerContext, TemplateMetadata, ContainerDefinition, MappingContext, KnowledgeContext, SourceAnalysis, VerificationResult, LayerOverride } from '../types';
 import { useProceduralStore } from '../store/ProceduralContext';
 import { getSemanticThemeObject, findLayerByPath, calculateGroupBounds } from '../services/psdService';
 import { useKnowledgeScoper } from '../hooks/useKnowledgeScoper';
@@ -24,6 +24,17 @@ const MAX_LAYER_DEPTH = 3;
 // Layer count for prompt context - provides good coverage of container contents
 const MAX_LAYERS_IN_PROMPT = 20;
 const DRAFT_DEBOUNCE_MS = 500;
+
+// Helper function to infer layout role from layer name
+const inferLayoutRoleFromName = (name: string): 'flow' | 'static' | 'overlay' | 'background' => {
+  const lower = name.toLowerCase();
+  if (lower.includes('bg') || lower.includes('background') || lower.includes('fill')) return 'background';
+  if (lower.includes('button') || lower.includes('cta') || lower.includes('win') ||
+      lower.includes('counter') || lower.includes('score') || lower.includes('header') ||
+      lower.includes('footer') || lower.includes('nav')) return 'static';
+  if (lower.includes('label') || lower.includes('badge') || lower.includes('tag')) return 'overlay';
+  return 'flow';
+};
 
 // Model configuration for Qwen local
 type ModelKey = 'qwen-local';
@@ -233,10 +244,11 @@ interface InstanceRowProps {
   compactMode: boolean;
   activeKnowledge: KnowledgeContext | null;
   error: string | null;
+  analysisStage: AnalysisStage;
 }
 
 const InstanceRow: React.FC<InstanceRowProps> = ({
-    nodeId, index, state, sourceData, targetData, onAnalyze, onToggleMute, onReset, isAnalyzing, compactMode, activeKnowledge, error
+    index, state, sourceData, targetData, onAnalyze, onToggleMute, onReset, isAnalyzing, compactMode, activeKnowledge, error, analysisStage
 }) => {
     const chatContainerRef = useRef<HTMLDivElement>(null);
     const activeModelConfig = MODELS[getModelKey(state.selectedModel)];
@@ -447,15 +459,61 @@ const InstanceRow: React.FC<InstanceRowProps> = ({
                         </div>
                     ))}
                     {isAnalyzing && (
-                        <div className="flex items-center space-x-2 text-xs text-slate-400 animate-pulse pl-1">
-                            <div className="w-1.5 h-1.5 bg-slate-400 rounded-full animate-bounce"></div>
-                            <span>Analyst is thinking...</span>
-                            {activeKnowledge && !state.isKnowledgeMuted && (
-                                <span className="text-[9px] text-teal-400 font-bold ml-1 flex items-center gap-1">
-                                    <Brain className="w-3 h-3" />
-                                    + Rules & Anchors
+                        <div className="space-y-2 pl-1">
+                            {/* 3-Stage Pipeline Progress */}
+                            <div className="flex items-center gap-2 text-[10px]">
+                                <div className={`flex items-center gap-1 px-2 py-1 rounded border transition-all ${
+                                    analysisStage === 'comprehension'
+                                        ? 'bg-purple-900/40 border-purple-500/50 text-purple-300 animate-pulse'
+                                        : analysisStage === 'layout' || analysisStage === 'verification' || analysisStage === 'complete'
+                                            ? 'bg-emerald-900/30 border-emerald-500/30 text-emerald-400'
+                                            : 'bg-slate-800/50 border-slate-700/50 text-slate-500'
+                                }`}>
+                                    <span className="font-bold">1</span>
+                                    <span>Comprehend</span>
+                                    {(analysisStage === 'layout' || analysisStage === 'verification' || analysisStage === 'complete') && <span>✓</span>}
+                                </div>
+                                <div className="text-slate-600">→</div>
+                                <div className={`flex items-center gap-1 px-2 py-1 rounded border transition-all ${
+                                    analysisStage === 'layout'
+                                        ? 'bg-cyan-900/40 border-cyan-500/50 text-cyan-300 animate-pulse'
+                                        : analysisStage === 'verification' || analysisStage === 'complete'
+                                            ? 'bg-emerald-900/30 border-emerald-500/30 text-emerald-400'
+                                            : 'bg-slate-800/50 border-slate-700/50 text-slate-500'
+                                }`}>
+                                    <span className="font-bold">2</span>
+                                    <span>Layout</span>
+                                    {(analysisStage === 'verification' || analysisStage === 'complete') && <span>✓</span>}
+                                </div>
+                                <div className="text-slate-600">→</div>
+                                <div className={`flex items-center gap-1 px-2 py-1 rounded border transition-all ${
+                                    analysisStage === 'verification'
+                                        ? 'bg-amber-900/40 border-amber-500/50 text-amber-300 animate-pulse'
+                                        : analysisStage === 'complete'
+                                            ? 'bg-emerald-900/30 border-emerald-500/30 text-emerald-400'
+                                            : 'bg-slate-800/50 border-slate-700/50 text-slate-500'
+                                }`}>
+                                    <span className="font-bold">3</span>
+                                    <span>Verify</span>
+                                    {analysisStage === 'complete' && <span>✓</span>}
+                                </div>
+                            </div>
+                            {/* Current stage description */}
+                            <div className="flex items-center space-x-2 text-xs text-slate-400 animate-pulse">
+                                <div className="w-1.5 h-1.5 bg-slate-400 rounded-full animate-bounce"></div>
+                                <span>
+                                    {analysisStage === 'comprehension' && 'Understanding source composition...'}
+                                    {analysisStage === 'layout' && 'Generating adaptive layout...'}
+                                    {analysisStage === 'verification' && 'Verifying semantic integrity...'}
+                                    {analysisStage === 'idle' && 'Initializing analysis...'}
                                 </span>
-                            )}
+                                {activeKnowledge && !state.isKnowledgeMuted && (
+                                    <span className="text-[9px] text-teal-400 font-bold ml-1 flex items-center gap-1">
+                                        <Brain className="w-3 h-3" />
+                                        + Rules & Anchors
+                                    </span>
+                                )}
+                            </div>
                         </div>
                     )}
                 </div>
@@ -487,9 +545,13 @@ const InstanceRow: React.FC<InstanceRowProps> = ({
     );
 };
 
+// Analysis stage type for 3-stage semantic pipeline
+type AnalysisStage = 'idle' | 'comprehension' | 'layout' | 'verification' | 'complete' | 'error';
+
 export const DesignAnalystNode = memo(({ id, data }: NodeProps<PSDNodeData>) => {
   const [analyzingInstances, setAnalyzingInstances] = useState<Record<number, boolean>>({});
   const [instanceErrors, setInstanceErrors] = useState<Record<number, string | null>>({});
+  const [analysisStages, setAnalysisStages] = useState<Record<number, AnalysisStage>>({});
   const [serverStatus, setServerStatus] = useState<'checking' | 'online' | 'offline'>('checking');
   const instanceCount = data.instanceCount || 1;
   const activeInstances = data.activeInstances;
@@ -614,18 +676,36 @@ export const DesignAnalystNode = memo(({ id, data }: NodeProps<PSDNodeData>) => 
           return null; 
       }
 
-      const drawLayers = (layerNodes: SerializableLayer[]) => {
-          for (let i = layerNodes.length - 1; i >= 0; i--) {
+      // Debug: Log layers being composited for AI analysis
+      console.log('[extractSourcePixels] Compositing layers for AI:', layers.map(l => ({
+          name: l.name,
+          visible: l.isVisible,
+          type: l.type,
+          childCount: l.children?.length || 0
+      })));
+
+      // Draw layers from bottom to top for correct compositing
+      // Based on logs: array is [BG, OPTIONS, PRIZE_FONT, TEXT, WIN_COUNTER] (bottom-to-top)
+      // So iterate FORWARD: index 0 (BG/bottom) first, index 4 (WIN_COUNTER/top) last
+      const drawLayers = (layerNodes: SerializableLayer[], depth = 0) => {
+          for (let i = 0; i < layerNodes.length; i++) {
               const node = layerNodes[i];
-              if (!node.isVisible) continue;
+              if (!node.isVisible) {
+                  console.log(`[extractSourcePixels] SKIP invisible: ${node.name}`);
+                  continue;
+              }
               if (node.children) {
-                  drawLayers(node.children);
+                  console.log(`[extractSourcePixels] ${'  '.repeat(depth)}GROUP: ${node.name} (${node.children.length} children)`);
+                  drawLayers(node.children, depth + 1);
               } else {
                   const agLayer = findLayerByPath(psd, node.id);
                   if (agLayer && agLayer.canvas) {
                       const dx = (agLayer.left || 0) - bounds.x;
                       const dy = (agLayer.top || 0) - bounds.y;
+                      console.log(`[extractSourcePixels] ${'  '.repeat(depth)}DRAW: ${node.name} at (${dx},${dy}) size ${agLayer.canvas.width}x${agLayer.canvas.height}`);
                       ctx.drawImage(agLayer.canvas, dx, dy);
+                  } else {
+                      console.log(`[extractSourcePixels] ${'  '.repeat(depth)}SKIP no canvas: ${node.name}`);
                   }
               }
           }
@@ -742,7 +822,285 @@ export const DesignAnalystNode = memo(({ id, data }: NodeProps<PSDNodeData>) => 
      });
   };
 
-  const generateSystemInstruction = (sourceData: any, targetData: any, effectiveRules: string | null, effectiveKnowledge: KnowledgeContext | null) => {
+  // ═══════════════════════════════════════════════════════════════════════════════
+  // STAGE 1: SOURCE COMPREHENSION
+  // Deep understanding of the source composition before any layout decisions
+  // ═══════════════════════════════════════════════════════════════════════════════
+  const generateSourceComprehension = async (
+    sourceImage: string,
+    containerName: string,
+    sourceW: number,
+    sourceH: number
+  ): Promise<SourceAnalysis> => {
+    const comprehensionPrompt = `You are an expert visual analyst. Your task is to deeply understand this design composition BEFORE any layout decisions are made.
+
+ANALYZE THE IMAGE AND ANSWER THESE QUESTIONS:
+
+═══════════════════════════════════════════════════════════════════════════════
+1. NARRATIVE & PURPOSE
+═══════════════════════════════════════════════════════════════════════════════
+- What is happening in this composition?
+- What message does it convey to the viewer?
+- What action is the user supposed to take?
+- What emotion or response should this evoke?
+
+═══════════════════════════════════════════════════════════════════════════════
+2. ELEMENT IDENTIFICATION
+═══════════════════════════════════════════════════════════════════════════════
+List ALL distinct visual elements you see:
+- PRIMARY: Main characters/objects that carry the message
+- SECONDARY: Supporting elements (text, labels, UI)
+- BACKGROUND: Decorative/atmospheric elements
+
+Be specific: "red potion with 1300 label" not just "potion"
+
+═══════════════════════════════════════════════════════════════════════════════
+3. VISUAL HIERARCHY
+═══════════════════════════════════════════════════════════════════════════════
+- What draws your eye FIRST? SECOND? THIRD?
+- Which single element is most important?
+- How does size/position/color create this hierarchy?
+
+═══════════════════════════════════════════════════════════════════════════════
+4. SPATIAL ARRANGEMENT & RATIONALE
+═══════════════════════════════════════════════════════════════════════════════
+- HOW are the main elements arranged? (triangular, horizontal row, vertical stack, grid, etc.)
+- WHY is this arrangement effective? (creates balance, shows choices, guides eye flow, etc.)
+- What spatial relationships are critical? (elements equidistant, title above choices, etc.)
+
+═══════════════════════════════════════════════════════════════════════════════
+5. PRESERVATION PRIORITIES
+═══════════════════════════════════════════════════════════════════════════════
+If this needs to fit a different aspect ratio:
+- MUST PRESERVE: What absolutely cannot change? (all choices visible, equal emphasis, etc.)
+- CAN ADAPT: What arrangement can be modified? (formation shape, spacing)
+- CAN SCALE: What can be made smaller if needed? (decorative elements, secondary text)
+
+CONTEXT:
+Container: "${containerName}" (${sourceW}x${sourceH}px)
+
+OUTPUT FORMAT:
+Respond with a JSON object matching the SourceAnalysis schema.
+Focus on UNDERSTANDING, not layout decisions.`;
+
+    const sourceAnalysisSchema: StructuredOutputSchema = {
+      type: 'object',
+      properties: {
+        narrative: { type: 'string', description: 'What story/purpose does this convey?' },
+        userExperience: { type: 'string', description: 'What is the user supposed to do/feel?' },
+        primaryElements: { type: 'array', items: { type: 'string' }, description: 'Main characters/objects' },
+        secondaryElements: { type: 'array', items: { type: 'string' }, description: 'Supporting elements' },
+        backgroundElements: { type: 'array', items: { type: 'string' }, description: 'Background/decorative elements' },
+        attentionOrder: { type: 'array', items: { type: 'string' }, description: 'What draws the eye: 1st, 2nd, 3rd...' },
+        dominantElement: { type: 'string', description: 'Single most important element' },
+        arrangement: { type: 'string', description: 'How elements are arranged' },
+        arrangementRationale: { type: 'string', description: 'WHY this arrangement is effective' },
+        keyRelationships: { type: 'array', items: { type: 'string' }, description: 'Spatial relationships that matter' },
+        mustPreserve: { type: 'array', items: { type: 'string' }, description: 'What MUST be maintained' },
+        canAdapt: { type: 'array', items: { type: 'string' }, description: 'What can be rearranged' },
+        canScale: { type: 'array', items: { type: 'string' }, description: 'What can be scaled down' }
+      },
+      required: ['narrative', 'userExperience', 'primaryElements', 'secondaryElements', 'backgroundElements',
+                 'attentionOrder', 'dominantElement', 'arrangement', 'arrangementRationale', 'keyRelationships',
+                 'mustPreserve', 'canAdapt', 'canScale']
+    };
+
+    const response = await generateCompletion({
+      systemPrompt: 'You are a visual composition analyst. Analyze images deeply and output structured JSON.',
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'image_url', image_url: { url: `data:image/png;base64,${sourceImage}`, detail: 'high' } },
+          { type: 'text', text: comprehensionPrompt }
+        ]
+      }],
+      responseSchema: sourceAnalysisSchema,
+      maxTokens: 2048,
+      temperature: 0.3
+    });
+
+    const rawJson = response.json || {};
+
+    // Provide defaults for missing fields
+    return {
+      narrative: rawJson.narrative || 'Unable to determine narrative',
+      userExperience: rawJson.userExperience || 'Unable to determine user experience',
+      primaryElements: rawJson.primaryElements || [],
+      secondaryElements: rawJson.secondaryElements || [],
+      backgroundElements: rawJson.backgroundElements || [],
+      attentionOrder: rawJson.attentionOrder || [],
+      dominantElement: rawJson.dominantElement || 'unknown',
+      arrangement: rawJson.arrangement || 'unknown arrangement',
+      arrangementRationale: rawJson.arrangementRationale || 'unknown rationale',
+      keyRelationships: rawJson.keyRelationships || [],
+      mustPreserve: rawJson.mustPreserve || [],
+      canAdapt: rawJson.canAdapt || [],
+      canScale: rawJson.canScale || []
+    };
+  };
+
+  // ═══════════════════════════════════════════════════════════════════════════════
+  // STAGE 3: SEMANTIC VERIFICATION
+  // Cross-check layout result against original composition intent
+  // ═══════════════════════════════════════════════════════════════════════════════
+  const verifyLayoutSemantically = async (
+    sourceAnalysis: SourceAnalysis,
+    layoutStrategy: LayoutStrategy,
+    sourceImage: string,
+    targetW: number,
+    targetH: number
+  ): Promise<VerificationResult> => {
+    const verificationPrompt = `You are a design QA specialist. Your task is to verify that a proposed layout preserves the original composition's intent.
+
+═══════════════════════════════════════════════════════════════════════════════
+ORIGINAL COMPOSITION ANALYSIS
+═══════════════════════════════════════════════════════════════════════════════
+NARRATIVE: ${sourceAnalysis.narrative}
+USER EXPERIENCE: ${sourceAnalysis.userExperience}
+PRIMARY ELEMENTS: ${sourceAnalysis.primaryElements.join(', ')}
+ATTENTION ORDER: ${sourceAnalysis.attentionOrder.join(' → ')}
+MUST PRESERVE: ${sourceAnalysis.mustPreserve.join('; ')}
+
+═══════════════════════════════════════════════════════════════════════════════
+PROPOSED LAYOUT
+═══════════════════════════════════════════════════════════════════════════════
+Target: ${targetW}x${targetH}px
+Scale: ${layoutStrategy.suggestedScale}x
+Layout Mode: ${layoutStrategy.spatialLayout || 'UNIFIED_FIT'}
+Method: ${layoutStrategy.method}
+
+Layer Overrides:
+${JSON.stringify(layoutStrategy.overrides || [], null, 2)}
+
+═══════════════════════════════════════════════════════════════════════════════
+VERIFICATION CHECKLIST
+═══════════════════════════════════════════════════════════════════════════════
+Answer YES or NO with explanation:
+
+1. NARRATIVE PRESERVED: Does the layout still tell the same story?
+   - Can the user still understand the purpose?
+   - Is the message clear?
+
+2. HIERARCHY MAINTAINED: Is the attention order preserved?
+   - Does "${sourceAnalysis.dominantElement}" still dominate?
+   - Do eyes flow in the intended order?
+
+3. ALL ELEMENTS VISIBLE: Will every element from "mustPreserve" be fully visible?
+   - No cropping?
+   - No off-screen elements?
+
+4. BALANCE: Is visual balance maintained?
+   - Elements evenly distributed?
+   - No awkward empty spaces?
+
+5. SCALE APPROPRIATE: At ${layoutStrategy.suggestedScale}x scale:
+   - Are primary elements still prominent enough?
+   - Is text still readable?
+
+═══════════════════════════════════════════════════════════════════════════════
+IF ISSUES FOUND - PROVIDE CORRECTIONS
+═══════════════════════════════════════════════════════════════════════════════
+If any check fails, you MUST provide corrected overrides.
+
+OVERRIDE COORDINATE SYSTEM:
+- xOffset/yOffset are ABSOLUTE positions relative to target container's top-left (0,0)
+- NOT relative offsets from original position
+- Each override completely REPLACES the geometric baseline
+
+Example for horizontal distribution in ${targetW}x${targetH} target:
+If 3 items need horizontal arrangement with 50px padding:
+- Item 1: xOffset = 50 + (itemWidth/2)
+- Item 2: xOffset = ${targetW}/2
+- Item 3: xOffset = ${targetW} - 50 - (itemWidth/2)
+
+Provide correctedOverrides with specific xOffset/yOffset values that fix the issues.
+
+═══════════════════════════════════════════════════════════════════════════════
+OUTPUT
+═══════════════════════════════════════════════════════════════════════════════
+If ALL checks pass: { "passed": true, "confidenceScore": 0.9, ... }
+If ANY check fails: { "passed": false, "issues": [...], "correctedOverrides": [...], ... }
+
+Respond with JSON matching the VerificationResult schema.`;
+
+    const verificationSchema: StructuredOutputSchema = {
+      type: 'object',
+      properties: {
+        passed: { type: 'boolean' },
+        narrativePreserved: { type: 'boolean' },
+        hierarchyMaintained: { type: 'boolean' },
+        allElementsVisible: { type: 'boolean' },
+        issues: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              type: { type: 'string', enum: ['missing_element', 'hierarchy_violation', 'balance_issue', 'cropping', 'other'] },
+              description: { type: 'string' },
+              suggestedFix: { type: 'string' }
+            },
+            required: ['type', 'description', 'suggestedFix']
+          }
+        },
+        correctedOverrides: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              layerId: { type: 'string' },
+              xOffset: { type: 'number' },
+              yOffset: { type: 'number' },
+              individualScale: { type: 'number' },
+              layoutRole: { type: 'string', enum: ['flow', 'static', 'overlay', 'background'] },
+              linkedAnchorId: { type: 'string' },
+              citedRule: { type: 'string' }
+            },
+            required: ['layerId', 'xOffset', 'yOffset', 'individualScale']
+          }
+        },
+        correctedScale: { type: 'number' },
+        confidenceScore: { type: 'number' },
+        verificationNotes: { type: 'string' }
+      },
+      required: ['passed', 'narrativePreserved', 'hierarchyMaintained', 'allElementsVisible', 'issues', 'confidenceScore', 'verificationNotes']
+    };
+
+    const response = await generateCompletion({
+      systemPrompt: 'You are a design QA specialist verifying layout compositions. Output structured JSON.',
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'image_url', image_url: { url: `data:image/png;base64,${sourceImage}`, detail: 'high' } },
+          { type: 'text', text: verificationPrompt }
+        ]
+      }],
+      responseSchema: verificationSchema,
+      maxTokens: 2048,
+      temperature: 0.2
+    });
+
+    const rawJson = response.json || {};
+
+    return {
+      passed: rawJson.passed ?? false,
+      narrativePreserved: rawJson.narrativePreserved ?? false,
+      hierarchyMaintained: rawJson.hierarchyMaintained ?? false,
+      allElementsVisible: rawJson.allElementsVisible ?? false,
+      issues: rawJson.issues || [],
+      correctedOverrides: rawJson.correctedOverrides,
+      correctedScale: rawJson.correctedScale,
+      confidenceScore: rawJson.confidenceScore ?? 0,
+      verificationNotes: rawJson.verificationNotes || ''
+    };
+  };
+
+  const generateSystemInstruction = (
+    sourceData: any,
+    targetData: any,
+    effectiveRules: string | null,
+    effectiveKnowledge: KnowledgeContext | null,
+    sourceAnalysis?: SourceAnalysis  // Stage 1 comprehension result
+  ) => {
     const sourceW = sourceData.container.bounds.w;
     const sourceH = sourceData.container.bounds.h;
     const targetW = targetData.bounds.w;
@@ -793,9 +1151,78 @@ export const DesignAnalystNode = memo(({ id, data }: NodeProps<PSDNodeData>) => 
     const isMismatch = Math.abs(sourceRatio - targetRatio) > ASPECT_RATIO_TOLERANCE;
 
     const getOrientation = (w: number, h: number) => w > h ? "Landscape" : (h > w ? "Portrait" : "Square");
+    const sourceOrientation = getOrientation(sourceW, sourceH);
+    const targetOrientation = getOrientation(targetW, targetH);
     const geometryContext = isMismatch
-        ? `GEOMETRY SHIFT: ${getOrientation(sourceW, sourceH)} -> ${getOrientation(targetW, targetH)}. You must RECOMPOSE the layout, not just scale it.`
+        ? `GEOMETRY SHIFT: ${sourceOrientation} -> ${targetOrientation}. You must RECOMPOSE the layout, not just scale it.`
         : `Geometry stable: similar aspect ratios.`;
+
+    // Expert Designer Persona - Constraint-First Design Philosophy
+    const expertPersona = `You are a Senior Art Director with 15 years of experience in adaptive layout design. You specialize in translating design assets across different aspect ratios and formats while preserving visual hierarchy and brand integrity.
+
+YOUR CORE PHILOSOPHY - CONSTRAINT-FIRST DESIGN:
+1. CONSTRAINTS ARE NON-NEGOTIABLE - Rules, spacing requirements, and target dimensions are hard boundaries
+2. VISUAL HIERARCHY IS SACRED - The eye must flow: Primary → Secondary → Tertiary → Background
+3. EVERY DECISION NEEDS JUSTIFICATION - If you can't cite why, don't do it
+4. WHEN IN DOUBT, PRESERVE READABILITY - Legibility beats aesthetics
+
+YOUR DECISION PROCESS (follow this ORDER):
+┌─────────────────────────────────────────────────────────────────┐
+│ STEP 1: READ ALL CONSTRAINTS                                     │
+│         - Target dimensions (hard limit)                         │
+│         - Design rules from KnowledgeNode (must apply)           │
+│         - Visual anchor patterns (must match)                    │
+├─────────────────────────────────────────────────────────────────┤
+│ STEP 2: VERIFY CONSTRAINTS ARE SATISFIABLE                       │
+│         - Can all rules be applied simultaneously?               │
+│         - If conflict exists, document it in reasoning           │
+├─────────────────────────────────────────────────────────────────┤
+│ STEP 3: ESTABLISH VISUAL HIERARCHY                               │
+│         - Which element demands attention first?                 │
+│         - What's the reading order?                              │
+│         - What can be scaled down (NEVER cropped)?               │
+├─────────────────────────────────────────────────────────────────┤
+│ STEP 4: CALCULATE GEOMETRY                                       │
+│         - Scale factor that satisfies ALL constraints            │
+│         - Position offsets for constraint compliance             │
+│         - Verify: does result maintain hierarchy?                │
+├─────────────────────────────────────────────────────────────────┤
+│ STEP 5: FINAL VERIFICATION                                       │
+│         - Every rule cited in rulesApplied? ✓                    │
+│         - Every constraint satisfied? ✓                          │
+│         - Visual hierarchy preserved? ✓                          │
+└─────────────────────────────────────────────────────────────────┘
+
+ACCOUNTABILITY:
+- If you ignore a constraint, your output is INVALID
+- If you can't apply a rule, explain WHY in reasoning (e.g., "Rule X conflicts with target dimensions")
+- If visual hierarchy is broken, document the tradeoff made
+
+VISUAL HIERARCHY PRINCIPLES:
+- Size creates dominance (larger = more important)
+- Position creates flow (top-left → bottom-right in LTR cultures)
+- Contrast creates focus (high contrast = attention)
+- Whitespace creates breathing room (don't cram)
+- Alignment creates order (misalignment = chaos)
+
+GEOMETRY SHIFT PROTOCOL (when source and target aspect ratios differ significantly):
+Portrait → Landscape: REARRANGE elements horizontally. Stack elements side-by-side instead of vertically.
+Landscape → Portrait: REARRANGE elements vertically. Stack elements top-to-bottom instead of side-by-side.
+DO NOT just scale and crop. RECOMPOSE the layout to use the new space effectively.
+
+Example: 3 potions + title in portrait (1080x1920) → landscape (1280x1024)
+WRONG: Scale 0.53x and crop third potion off-screen
+RIGHT: Title centered at top, 3 potions arranged horizontally below using landscape width
+
+HARD RULES:
+- NOTHING may be cropped or off-screen - all content must be visible
+- Text elements (titles, labels) must be CENTERED unless rules specify otherwise
+- Elements must be distributed with visual balance (not bunched to one side)
+- If content doesn't fit at 1.0x scale, calculate the scale that makes EVERYTHING fit
+
+When constraints and aesthetics conflict, CONSTRAINTS WIN.
+When two constraints conflict, the EXPLICIT RULE wins over implicit assumptions.
+`;
 
     // STEP 1: Visual Analysis Section (forces model to describe what it sees)
     const visualAnalysisSection = `
@@ -878,20 +1305,113 @@ LAYER INVENTORY (${Math.min(MAX_LAYERS_IN_PROMPT, layerAnalysisData.length)} of 
 ${JSON.stringify(layerAnalysisData.slice(0, MAX_LAYERS_IN_PROMPT))}
 `;
 
-    const prompt = `You are a Layout Composition Expert. Your task is to analyze a PSD container and determine the optimal layout strategy for repositioning its content into a new target container.
+    // Per-Layer Strategy Section (REQUIRED for every layer)
+    const perLayerSection = `
+═══════════════════════════════════════════════════════════════════════════════
+PER-LAYER LAYOUT STRATEGY (REQUIRED FOR EVERY LAYER)
+═══════════════════════════════════════════════════════════════════════════════
+You MUST generate an override for EVERY layer in the LAYER INVENTORY above.
+Each layer must be CLASSIFIED and given appropriate scale/position for its role.
+
+ROLE DEFINITIONS AND TRANSFORM BEHAVIORS:
+
+▸ "background" - Full-bleed fills, textures, base images
+  - ALWAYS stretch to fill entire target container (non-uniform scaling OK)
+  - scaleX = ${targetW} / layerWidth
+  - scaleY = ${targetH} / layerHeight
+  - xOffset = 0, yOffset = 0 (fills from top-left)
+
+▸ "flow" - Main content (game elements, images, text blocks)
+  - MAINTAIN relative position within container
+  - Scale proportionally (uniform scaleX = scaleY)
+  - Position = (originalRelativePosition × targetDimensions)
+  - Example: Element at 30% from left stays at 30% from left
+
+▸ "static" - UI elements (buttons, counters, labels, headers)
+  - PIN to relative edge distances using edgeAnchor
+  - edgeAnchor: {horizontal: 'left'|'center'|'right', vertical: 'top'|'center'|'bottom'}
+  - Keep similar size (scale ~1.0) to maintain legibility
+  - Example: WIN counter 100px from bottom in ${sourceH}px source → ${Math.round(100 * targetH / sourceH)}px from bottom in ${targetH}px target
+
+▸ "overlay" - Elements attached to other layers (labels on images, badges)
+  - Specify linkedAnchorId (the parent layer's id)
+  - Position relative to parent layer
+  - Scale with parent
+
+CALCULATION FORMULAS:
+
+For source ${sourceW}x${sourceH} → target ${targetW}x${targetH}:
+- Aspect scale: ${(targetW/sourceW).toFixed(3)} horizontal, ${(targetH/sourceH).toFixed(3)} vertical
+- Background: scaleX=${(targetW/sourceW).toFixed(3)}, scaleY=${(targetH/sourceH).toFixed(3)}
+- Content proportional scale: ${Math.min(targetW/sourceW, targetH/sourceH).toFixed(3)}
+
+For a layer at relX=0.3, relY=0.5 (from source top-left):
+- New position: xOffset = ${Math.round(0.3 * targetW)}, yOffset = ${Math.round(0.5 * targetH)}
+
+OUTPUT REQUIREMENT:
+The "overrides" array MUST contain one entry for EVERY layer in the inventory.
+Each override MUST have: layerId, layoutRole, xOffset, yOffset, and scale values.
+Missing layers = INVALID OUTPUT.
+`;
+
+    // Constraint summary for the task header
+    const constraintSummary = `CONSTRAINT SUMMARY:
+- Target bounds: ${targetW}x${targetH}px (HARD LIMIT - content must fit)
+${effectiveRules ? `- Design rules: ${effectiveRules.split('\n').filter(r => r.trim()).length} rules to apply (see MANDATORY DESIGN RULES)` : '- Design rules: None provided'}
+${effectiveKnowledge?.visualAnchors?.length ? `- Visual anchors: ${effectiveKnowledge.visualAnchors.length} reference image(s) to match` : '- Visual anchors: None provided'}`;
+
+    // SOURCE COMPREHENSION section (from Stage 1 analysis) - CONCISE version
+    const sourceComprehensionSection = sourceAnalysis && sourceAnalysis.primaryElements.length > 0 ? `
+SOURCE ANALYSIS (from Stage 1 - use this, don't re-analyze):
+- Primary elements: ${sourceAnalysis.primaryElements.join(', ')}
+- Arrangement: ${sourceAnalysis.arrangement}
+- Dominant: ${sourceAnalysis.dominantElement}
+- Must preserve: ${sourceAnalysis.mustPreserve.join(', ') || 'all visible'}
+
+TASK: Adapt from ${sourceOrientation} (${sourceW}x${sourceH}) to ${targetOrientation} (${targetW}x${targetH})
+${targetW > targetH ? 'Target is LANDSCAPE - spread elements horizontally.' : 'Target is PORTRAIT - stack elements vertically.'}
+
+Your visualAnalysis must mention: ${sourceAnalysis.primaryElements.slice(0, 3).join(', ')}
+` : '';
+
+    // Constraint verification checklist
+    const constraintVerification = `
+═══════════════════════════════════════════════════════════════════════════════
+CONSTRAINT VERIFICATION CHECKLIST (Complete before outputting)
+═══════════════════════════════════════════════════════════════════════════════
+Before finalizing your response, verify:
+
+□ ALL CONTENT VISIBLE: Will EVERY element from the source be visible in the target? (NO cropping allowed)
+□ TARGET BOUNDS: Does scaled content fit within ${targetW}x${targetH}? If not, reduce suggestedScale.
+□ TEXT CENTERED: Are title/text elements horizontally centered (unless rules say otherwise)?
+□ VISUAL BALANCE: Are elements distributed evenly, not bunched to one side?
+□ GEOMETRY SHIFT: If aspect ratio changed significantly, did you RECOMPOSE (not just scale)?
+□ PADDING RULES: If rules specify padding, is suggestedScale adjusted to leave that clearance?
+□ RULE COVERAGE: Is every rule from <RULES> block cited in rulesApplied array?
+
+If ANY check fails, adjust your output before responding.
+
+CRITICAL: If you would crop content to fit, STOP. Reduce scale or recompose layout instead.
+`;
+
+    const prompt = `${expertPersona}
 
 ═══════════════════════════════════════════════════════════════════════════════
-TASK SUMMARY
+CURRENT TASK
 ═══════════════════════════════════════════════════════════════════════════════
 Source Container: "${sourceData.container.containerName}" (${sourceW}x${sourceH}px)
 Target Container: "${targetData.name}" (${targetW}x${targetH}px)
 ${geometryContext}
-${visualAnalysisSection}
+
+${constraintSummary}
+${sourceComprehensionSection}
+${sourceAnalysis ? '' : visualAnalysisSection}
 ${knowledgeSection}
 ${anchorSection}
 ${layerDataSection}
+${perLayerSection}
 ═══════════════════════════════════════════════════════════════════════════════
-YOUR DECISIONS
+YOUR DECISIONS (Apply your constraint-first methodology)
 ═══════════════════════════════════════════════════════════════════════════════
 
 1. SPATIAL LAYOUT (pick ONE):
@@ -912,10 +1432,11 @@ YOUR DECISIONS
    - "background" - Full-bleed texture at bottom of stack
 
 4. SCALE CALCULATION:
-   - Calculate suggestedScale so content fits within target bounds with proper padding
+   - Calculate suggestedScale so ALL content fits within target bounds
    - If rules specify padding (e.g., "50px from edges"), account for it:
      availableWidth = targetW - (2 x padding)
    - Scale = min(availableWidth / contentWidth, availableHeight / contentHeight)
+   - NEVER choose a scale that would crop content
 
 5. OVERRIDES (for layers needing special treatment):
    Each override needs: layerId, xOffset, yOffset, individualScale, layoutRole
@@ -933,23 +1454,21 @@ Confidence levels:
 - HIGH (3/3 sources agree)
 - MEDIUM (2/3 sources agree)
 - LOW (0-1 sources agree - use geometric fallback)
-
-═══════════════════════════════════════════════════════════════════════════════
-OUTPUT REQUIREMENTS
-═══════════════════════════════════════════════════════════════════════════════
-- visualAnalysis: REQUIRED - Describe what you SEE in the source image (specific details, not generic)
-- rulesApplied: REQUIRED - Array of {rule, application} for each design rule you used
-- method: Always "GEOMETRIC" unless rules explicitly authorize "GENERATIVE"
-- generativePrompt: Empty string "" unless method is GENERATIVE
-- knowledgeApplied: true if you used any design rules
-- semanticAnchors: List 3-5 key visual elements that define this content
-- reasoning: Explain your layout decisions and how you applied the rules
+${constraintVerification}
+OUTPUT REQUIREMENTS:
+- visualAnalysis: Describe what you see (be specific, not generic)
+- rulesApplied: Array of {rule, application} for each design rule
+- method: "GEOMETRIC" (default) or "GENERATIVE" if rules say so
+- generativePrompt: "" unless method is GENERATIVE
+- suggestedScale: Scale factor so all content fits in target
+- overrides: Array of layer adjustments with xOffset, yOffset, individualScale
+- reasoning: Explain your layout decisions
 
 Think step by step:
-1. What content is in this container? (visual analysis -> visualAnalysis field)
-2. What do the rules require? (rule interpretation -> rulesApplied field)
-3. How should elements be arranged in the new space? (composition)
-4. What scale and positions achieve proper spacing? (math)`;
+1. What content is in this container?
+2. How should elements be arranged in the new ${targetW}x${targetH} space?
+3. What scale keeps ALL content visible?
+4. Verify nothing is cropped`;
 
     return prompt;
   };
@@ -974,11 +1493,43 @@ Think step by step:
 
       setAnalyzingInstances(prev => ({ ...prev, [index]: true }));
       setInstanceErrors(prev => ({ ...prev, [index]: null }));
+      setAnalysisStages(prev => ({ ...prev, [index]: 'comprehension' }));
 
       try {
-        const systemInstruction = generateSystemInstruction(sourceData, targetData, effectiveRules, effectiveKnowledge);
-        console.log('[Analyst] System prompt length:', systemInstruction.length, 'chars');
+        // Extract source pixels once for all stages
         const sourcePixelsBase64 = await extractSourcePixels(sourceData.layers as SerializableLayer[], sourceData.container.bounds);
+        const base64Clean = sourcePixelsBase64 ? sourcePixelsBase64.split(',')[1] : '';
+
+        // ═══════════════════════════════════════════════════════════════════════════════
+        // STAGE 1: SOURCE COMPREHENSION
+        // Deep understanding of the source composition before any layout decisions
+        // ═══════════════════════════════════════════════════════════════════════════════
+        console.log('[Analyst] Stage 1: Source Comprehension');
+        let sourceAnalysis: SourceAnalysis | undefined;
+
+        if (base64Clean) {
+          sourceAnalysis = await generateSourceComprehension(
+            base64Clean,
+            sourceData.container.containerName,
+            sourceData.container.bounds.w,
+            sourceData.container.bounds.h
+          );
+          console.log('[Analyst] Source comprehension:', {
+            narrative: sourceAnalysis.narrative.substring(0, 100) + '...',
+            primaryElements: sourceAnalysis.primaryElements,
+            arrangement: sourceAnalysis.arrangement
+          });
+        }
+
+        // ═══════════════════════════════════════════════════════════════════════════════
+        // STAGE 2: LAYOUT GENERATION
+        // Use comprehension to guide intelligent layout decisions
+        // ═══════════════════════════════════════════════════════════════════════════════
+        setAnalysisStages(prev => ({ ...prev, [index]: 'layout' }));
+        console.log('[Analyst] Stage 2: Layout Generation');
+
+        const systemInstruction = generateSystemInstruction(sourceData, targetData, effectiveRules, effectiveKnowledge, sourceAnalysis);
+        console.log('[Analyst] System prompt length:', systemInstruction.length, 'chars');
 
         // Build messages in provider-agnostic format
         const messages: { role: 'user' | 'assistant'; content: ContentPart[] }[] = [];
@@ -1096,12 +1647,21 @@ Think step by step:
                             xOffset: { type: 'number' },
                             yOffset: { type: 'number' },
                             individualScale: { type: 'number' },
+                            scaleX: { type: 'number' },
+                            scaleY: { type: 'number' },
                             citedRule: { type: 'string' },
                             anchorIndex: { type: 'integer' },
                             layoutRole: { type: 'string', enum: ['flow', 'static', 'overlay', 'background'] },
-                            linkedAnchorId: { type: 'string' }
+                            linkedAnchorId: { type: 'string' },
+                            edgeAnchor: {
+                                type: 'object',
+                                properties: {
+                                    horizontal: { type: 'string', enum: ['left', 'center', 'right'] },
+                                    vertical: { type: 'string', enum: ['top', 'center', 'bottom'] }
+                                }
+                            }
                         },
-                        required: ['layerId', 'xOffset', 'yOffset', 'individualScale']
+                        required: ['layerId', 'layoutRole', 'xOffset', 'yOffset']
                     }
                 },
                 safetyReport: {
@@ -1154,6 +1714,81 @@ Think step by step:
             knowledgeMuted: false,
         };
 
+        // --- PER-LAYER OVERRIDE VALIDATION ---
+        // Ensure every layer has an override (generate defaults for missing layers)
+        const flattenLayerIds = (layers: SerializableLayer[], depth = 0, maxDepth = MAX_LAYER_DEPTH): { id: string; name: string; coords: any; }[] => {
+            if (depth > maxDepth) return [];
+            let result: { id: string; name: string; coords: any; }[] = [];
+            for (const layer of layers) {
+                if (layer.type === 'layer' || depth <= 1) {
+                    result.push({ id: layer.id, name: layer.name, coords: layer.coords });
+                }
+                if (layer.children && depth < maxDepth) {
+                    result = result.concat(flattenLayerIds(layer.children, depth + 1, maxDepth));
+                }
+            }
+            return result;
+        };
+
+        const allLayers = flattenLayerIds(sourceData.layers as SerializableLayer[]);
+        const overrideLayerIds = new Set((json.overrides || []).map((o: LayerOverride) => o.layerId));
+        const missingLayers = allLayers.filter(l => !overrideLayerIds.has(l.id));
+
+        if (missingLayers.length > 0) {
+            console.log(`[Analyst] Missing overrides for ${missingLayers.length} layers, generating defaults`);
+            const sourceW = sourceData.container.bounds.w;
+            const sourceH = sourceData.container.bounds.h;
+            const sourceX = sourceData.container.bounds.x;
+            const sourceY = sourceData.container.bounds.y;
+            const tgtW = targetData.bounds.w;
+            const tgtH = targetData.bounds.h;
+            const proportionalScale = Math.min(tgtW / sourceW, tgtH / sourceH);
+
+            for (const layer of missingLayers) {
+                const role = inferLayoutRoleFromName(layer.name);
+                const relX = (layer.coords.x - sourceX) / sourceW;
+                const relY = (layer.coords.y - sourceY) / sourceH;
+
+                let override: LayerOverride;
+                if (role === 'background') {
+                    // Stretch to fill
+                    override = {
+                        layerId: layer.id,
+                        layoutRole: 'background',
+                        xOffset: 0,
+                        yOffset: 0,
+                        individualScale: 1,
+                        scaleX: tgtW / layer.coords.w,
+                        scaleY: tgtH / layer.coords.h,
+                    };
+                } else if (role === 'static') {
+                    // Pin to edges with proportional positioning
+                    override = {
+                        layerId: layer.id,
+                        layoutRole: 'static',
+                        xOffset: relX * tgtW,
+                        yOffset: relY * tgtH,
+                        individualScale: 1, // Keep readable
+                        edgeAnchor: {
+                            horizontal: relX < 0.33 ? 'left' : (relX > 0.66 ? 'right' : 'center'),
+                            vertical: relY < 0.33 ? 'top' : (relY > 0.66 ? 'bottom' : 'center'),
+                        },
+                    };
+                } else {
+                    // Flow - proportional scaling and positioning
+                    override = {
+                        layerId: layer.id,
+                        layoutRole: role,
+                        xOffset: relX * tgtW,
+                        yOffset: relY * tgtH,
+                        individualScale: proportionalScale,
+                    };
+                }
+                json.overrides.push(override);
+            }
+            console.log(`[Analyst] Total overrides after defaults: ${json.overrides.length}`);
+        }
+
         // --- GEOMETRY FLAG INJECTION ---
         // Calculate ratio difference to flag the payload
         const sourceRatio = sourceData.container.bounds.w / sourceData.container.bounds.h;
@@ -1182,10 +1817,65 @@ Think step by step:
         // Debug: Log new prompt engineering fields
         console.log('[Analyst] Response - visualAnalysis length:', json.visualAnalysis?.length || 0);
         console.log('[Analyst] Response - rulesApplied count:', json.rulesApplied?.length || 0);
+        console.log('[Analyst] Response - overrides count:', json.overrides?.length || 0);
+
+        // ═══════════════════════════════════════════════════════════════════════════════
+        // STAGE 3: SEMANTIC VERIFICATION
+        // Cross-check layout result against original composition intent
+        // ═══════════════════════════════════════════════════════════════════════════════
+        let finalStrategy = json;
+
+        if (sourceAnalysis && base64Clean) {
+          setAnalysisStages(prev => ({ ...prev, [index]: 'verification' }));
+          console.log('[Analyst] Stage 3: Semantic Verification');
+
+          try {
+            const verification = await verifyLayoutSemantically(
+              sourceAnalysis,
+              json as LayoutStrategy,
+              base64Clean,
+              targetData.bounds.w,
+              targetData.bounds.h
+            );
+
+            console.log('[Analyst] Verification result:', {
+              passed: verification.passed,
+              narrativePreserved: verification.narrativePreserved,
+              hierarchyMaintained: verification.hierarchyMaintained,
+              allElementsVisible: verification.allElementsVisible,
+              issueCount: verification.issues.length,
+              confidence: verification.confidenceScore
+            });
+
+            // Apply corrections if verification failed and corrections are provided
+            if (!verification.passed && verification.correctedOverrides && verification.correctedOverrides.length > 0) {
+              console.log('[Analyst] Applying verification corrections:', verification.correctedOverrides.length, 'override corrections');
+              finalStrategy = {
+                ...json,
+                overrides: verification.correctedOverrides,
+                suggestedScale: verification.correctedScale ?? json.suggestedScale,
+                reasoning: json.reasoning + '\n\n[STAGE 3 VERIFICATION CORRECTIONS APPLIED]\n' +
+                  verification.issues.map(i => `- ${i.type}: ${i.description}`).join('\n')
+              };
+            } else if (!verification.passed) {
+              console.log('[Analyst] Verification failed but no corrections provided:', verification.issues);
+              finalStrategy = {
+                ...json,
+                reasoning: json.reasoning + '\n\n[STAGE 3 VERIFICATION WARNINGS]\n' +
+                  verification.issues.map(i => `- ${i.type}: ${i.description} (Suggested: ${i.suggestedFix})`).join('\n')
+              };
+            }
+          } catch (verifyError) {
+            console.warn('[Analyst] Stage 3 verification failed, using Stage 2 result:', verifyError);
+            // Continue with Stage 2 result if verification fails
+          }
+        }
+
+        setAnalysisStages(prev => ({ ...prev, [index]: 'complete' }));
 
         // Create stripped version for persistence (removes base64 image data to prevent file bloat)
         // sourceReference can be 20MB+ and would be stored in both chatHistory and layoutStrategy
-        const { sourceReference, ...persistableStrategy } = json;
+        const { sourceReference, ...persistableStrategy } = finalStrategy;
 
         const newAiMessage: ChatMessage = {
             id: Date.now().toString(),
@@ -1200,20 +1890,20 @@ Think step by step:
         updateInstanceState(index, { chatHistory: finalHistory, layoutStrategy: persistableStrategy });
 
         const isExplicitIntent = history.some(msg => msg.role === 'user' && /\b(generate|recreate)\b/i.test(msg.parts[0].text));
-        
+
         const augmentedContext: MappingContext = {
             ...sourceData,
-            aiStrategy: { ...json, isExplicitIntent },
+            aiStrategy: { ...finalStrategy, isExplicitIntent },
             previewUrl: undefined,
             targetDimensions: targetData ? { w: targetData.bounds.w, h: targetData.bounds.h } : undefined
         };
-        
+
         registerResolved(id, `source-out-${index}`, augmentedContext);
 
-        if ((json.method === 'GENERATIVE' || json.method === 'HYBRID') && json.generativePrompt) {
+        if ((finalStrategy.method === 'GENERATIVE' || finalStrategy.method === 'HYBRID') && finalStrategy.generativePrompt) {
              if (draftTimeoutRef.current) clearTimeout(draftTimeoutRef.current);
              draftTimeoutRef.current = setTimeout(async () => {
-                 const url = await generateDraft(json.generativePrompt, json.sourceReference);
+                 const url = await generateDraft(finalStrategy.generativePrompt, finalStrategy.sourceReference);
                  if (url) {
                      const contextWithPreview: MappingContext = {
                          ...augmentedContext,
@@ -1229,6 +1919,7 @@ Think step by step:
           console.error("Analysis Failed:", e);
           const errorMessage = e?.message || 'Analysis failed. Check console for details.';
           setInstanceErrors(prev => ({ ...prev, [index]: errorMessage }));
+          setAnalysisStages(prev => ({ ...prev, [index]: 'error' }));
       } finally {
           setAnalyzingInstances(prev => ({ ...prev, [index]: false }));
       }
@@ -1295,6 +1986,7 @@ Think step by step:
                       onAnalyze={handleAnalyze} onToggleMute={handleToggleMute} onReset={handleReset}
                       isAnalyzing={!!analyzingInstances[i]} compactMode={effectiveIndices.length > 1}
                       activeKnowledge={activeKnowledge} error={instanceErrors[i] || null}
+                      analysisStage={analysisStages[i] || 'idle'}
                   />
               );
           })}
