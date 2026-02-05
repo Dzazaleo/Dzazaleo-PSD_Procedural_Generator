@@ -879,6 +879,20 @@ If this needs to fit a different aspect ratio:
 - CAN ADAPT: What arrangement can be modified? (formation shape, spacing)
 - CAN SCALE: What can be made smaller if needed? (decorative elements, secondary text)
 
+═══════════════════════════════════════════════════════════════════════════════
+6. SEMANTIC GROUPINGS (CRITICAL)
+═══════════════════════════════════════════════════════════════════════════════
+Identify elements that are VISUALLY PAIRED — they must move together as a unit.
+For each group: what is the "anchor" (larger/main element) and what are its "companions" (attached smaller elements)?
+
+Look for:
+- Labels/values ON or NEXT TO objects (e.g., a price tag on a product, a score next to a character)
+- Text captions paired with images
+- Icons/badges attached to UI elements
+- Any small element whose meaning depends on its proximity to a larger element
+
+These pairs MUST stay together when the layout changes. A label separated from its object loses meaning.
+
 CONTEXT:
 Container: "${containerName}" (${sourceW}x${sourceH}px)
 
@@ -901,11 +915,24 @@ Focus on UNDERSTANDING, not layout decisions.`;
         keyRelationships: { type: 'array', items: { type: 'string' }, description: 'Spatial relationships that matter' },
         mustPreserve: { type: 'array', items: { type: 'string' }, description: 'What MUST be maintained' },
         canAdapt: { type: 'array', items: { type: 'string' }, description: 'What can be rearranged' },
-        canScale: { type: 'array', items: { type: 'string' }, description: 'What can be scaled down' }
+        canScale: { type: 'array', items: { type: 'string' }, description: 'What can be scaled down' },
+        semanticGroups: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              anchor: { type: 'string', description: 'Main/larger element in the group' },
+              companions: { type: 'array', items: { type: 'string' }, description: 'Smaller elements that should stay with the anchor' },
+              relationship: { type: 'string', description: 'How they relate (e.g., "prize label on object")' }
+            },
+            required: ['anchor', 'companions', 'relationship']
+          },
+          description: 'Groups of elements that must move together (labels on objects, values with counters, etc.)'
+        }
       },
       required: ['narrative', 'userExperience', 'primaryElements', 'secondaryElements', 'backgroundElements',
                  'attentionOrder', 'dominantElement', 'arrangement', 'arrangementRationale', 'keyRelationships',
-                 'mustPreserve', 'canAdapt', 'canScale']
+                 'mustPreserve', 'canAdapt', 'canScale', 'semanticGroups']
     };
 
     console.log('[Analyst] Stage 1 Full Prompt:\n', comprehensionPrompt);
@@ -940,7 +967,8 @@ Focus on UNDERSTANDING, not layout decisions.`;
       keyRelationships: rawJson.keyRelationships || [],
       mustPreserve: rawJson.mustPreserve || [],
       canAdapt: rawJson.canAdapt || [],
-      canScale: rawJson.canScale || []
+      canScale: rawJson.canScale || [],
+      semanticGroups: rawJson.semanticGroups || []
     };
   };
 
@@ -1099,9 +1127,12 @@ Output JSON: { "passed": bool, "issues": [...], "correctedOverrides": [...] (if 
                     depth: depth,
                     relX: (effectiveCoords.x - sourceData.container.bounds.x) / sourceW,
                     relY: (effectiveCoords.y - sourceData.container.bounds.y) / sourceH,
+                    absX: effectiveCoords.x,
+                    absY: effectiveCoords.y,
                     width: effectiveCoords.w,
                     height: effectiveCoords.h,
-                    childCount: l.children?.length ?? 0
+                    childCount: l.children?.length ?? 0,
+                    isVisible: l.isVisible !== false
                 });
             }
 
@@ -1113,6 +1144,43 @@ Output JSON: { "passed": bool, "issues": [...], "correctedOverrides": [...] (if 
     };
 
     const layerAnalysisData = flattenLayers(sourceData.layers as SerializableLayer[]);
+
+    // Compute spatial proximity: for each layer, find the closest larger layer it overlaps with
+    // This helps the AI detect companion elements (labels on objects, values near counters)
+    const proximityMap = new Map<string, string>(); // small layer id -> anchor layer id
+    for (const layer of layerAnalysisData) {
+      if (!layer.isVisible) continue;
+      const layerArea = layer.width * layer.height;
+      let bestAnchor: { id: string; name: string; area: number } | null = null;
+
+      for (const candidate of layerAnalysisData) {
+        if (candidate.id === layer.id || !candidate.isVisible) continue;
+        const candidateArea = candidate.width * candidate.height;
+        // Candidate must be significantly larger (at least 1.5x area)
+        if (candidateArea <= layerArea * 1.5) continue;
+
+        // Check bounding box overlap
+        const overlapX = Math.max(0,
+          Math.min(layer.absX + layer.width, candidate.absX + candidate.width) -
+          Math.max(layer.absX, candidate.absX));
+        const overlapY = Math.max(0,
+          Math.min(layer.absY + layer.height, candidate.absY + candidate.height) -
+          Math.max(layer.absY, candidate.absY));
+        const overlapArea = overlapX * overlapY;
+
+        // Significant overlap: > 30% of the smaller layer's area
+        if (overlapArea > layerArea * 0.3) {
+          // Pick the smallest qualifying anchor (most specific parent)
+          if (!bestAnchor || candidateArea < bestAnchor.area) {
+            bestAnchor = { id: candidate.id, name: candidate.name, area: candidateArea };
+          }
+        }
+      }
+
+      if (bestAnchor) {
+        proximityMap.set(layer.id, bestAnchor.id);
+      }
+    }
 
     const sourceRatio = sourceW / sourceH;
     const targetRatio = targetW / targetH;
@@ -1175,12 +1243,14 @@ VISUAL ANCHORS: ${effectiveKnowledge.visualAnchors.length} reference image(s) fo
 ` : '';
 
     // Layer Data Section (compact table format to save tokens)
-    const layerRows = layerAnalysisData.slice(0, MAX_LAYERS_IN_PROMPT).map(l =>
-      `${l.id} | ${l.name} | ${l.relX.toFixed(2)},${l.relY.toFixed(2)} | ${l.width}x${l.height} | ${l.type}${l.childCount > 0 ? ` (${l.childCount}ch)` : ''}`
-    ).join('\n');
+    const layerRows = layerAnalysisData.slice(0, MAX_LAYERS_IN_PROMPT).map(l => {
+      const vis = l.isVisible ? '' : ' [HIDDEN]';
+      const near = proximityMap.has(l.id) ? ` near:${proximityMap.get(l.id)}` : '';
+      return `${l.id} | ${l.name}${vis} | ${l.relX.toFixed(2)},${l.relY.toFixed(2)} | ${l.width}x${l.height} | ${l.type}${l.childCount > 0 ? ` (${l.childCount}ch)` : ''}${near}`;
+    }).join('\n');
     const layerDataSection = `
 LAYERS (${layerAnalysisData.length} total, showing ${Math.min(MAX_LAYERS_IN_PROMPT, layerAnalysisData.length)}):
-Classify each by name: bg/background/fill→"background", button/cta/nav→"static", label/badge→"overlay", else→"flow"
+[HIDDEN] = invisible layer (skip or minimal override). "near:ID" = spatially overlaps that layer.
 ID | Name | RelX,RelY | WxH | Type
 ${layerRows}
 `;
@@ -1192,9 +1262,17 @@ PER-LAYER OVERRIDES (one override per layer, NO EXCEPTIONS):
 
 Role behaviors:
 - "background": stretch to fill. scaleX=${(targetW/sourceW).toFixed(3)}, scaleY=${(targetH/sourceH).toFixed(3)}, xOffset=0, yOffset=0
-- "flow": proportional positioning. scale=${proportionalScale.toFixed(3)}, position = relativePos × targetDims
+- "flow": independent element with proportional positioning. scale=${proportionalScale.toFixed(3)}, position = relativePos × targetDims
 - "static": edge-pinned UI. scale~1.0, use edgeAnchor {horizontal,vertical}
-- "overlay": attached to parent via linkedAnchorId, scales with parent
+- "overlay": COMPANION element that MOVES WITH its parent. Set linkedAnchorId to the parent layer's ID.
+  The overlay will be repositioned relative to its anchor automatically — just set same xOffset/yOffset as anchor.
+  USE THIS for: labels on objects, values near counters, badges on items, captions with images.
+  If a layer has "near:ID" in the layer table, it likely overlaps that layer and may be its companion.
+
+SEMANTIC GROUPING RULE (CRITICAL):
+When elements are visually paired (a label sits on/near an object), the SMALLER element must be "overlay" with
+linkedAnchorId pointing to the LARGER element. This ensures they move together during layout recomposition.
+Do NOT make both elements "flow" — they will be separated.
 
 Source ${sourceW}x${sourceH} → Target ${targetW}x${targetH}
 Proportional scale: ${proportionalScale.toFixed(3)}
@@ -1210,13 +1288,19 @@ ${effectiveRules ? `- Design rules: ${effectiveRules.split('\n').filter(r => r.t
 ${effectiveKnowledge?.visualAnchors?.length ? `- Visual anchors: ${effectiveKnowledge.visualAnchors.length} reference image(s) to match` : '- Visual anchors: None provided'}`;
 
     // SOURCE COMPREHENSION section (from Stage 1 analysis) - CONCISE version
+    const semanticGroupsText = sourceAnalysis?.semanticGroups && sourceAnalysis.semanticGroups.length > 0
+      ? `\nSEMANTIC GROUPS (elements that MUST move together — use "overlay" + linkedAnchorId):\n${sourceAnalysis.semanticGroups.map(g =>
+          `  ${g.anchor} ← [${g.companions.join(', ')}] (${g.relationship})`
+        ).join('\n')}\nMatch these groups to layer IDs in the table below. Companions → overlay role, linkedAnchorId = anchor's layer ID.\n`
+      : '';
+
     const sourceComprehensionSection = sourceAnalysis && sourceAnalysis.primaryElements.length > 0 ? `
 SOURCE ANALYSIS (from Stage 1 - use this, don't re-analyze):
 - Primary elements: ${sourceAnalysis.primaryElements.join(', ')}
 - Arrangement: ${sourceAnalysis.arrangement}
 - Dominant: ${sourceAnalysis.dominantElement}
 - Must preserve: ${sourceAnalysis.mustPreserve.join(', ') || 'all visible'}
-
+${semanticGroupsText}
 TASK: Adapt from ${sourceOrientation} (${sourceW}x${sourceH}) to ${targetOrientation} (${targetW}x${targetH})
 ${targetW > targetH ? 'Target is LANDSCAPE - spread elements horizontally.' : 'Target is PORTRAIT - stack elements vertically.'}
 
@@ -1548,6 +1632,136 @@ Think: 1) What's here? 2) How to arrange in ${targetW}x${targetH}? 3) What scale
                 return role === 'flow' || role === 'overlay';
             });
 
+            // --- SPATIAL PROXIMITY DETECTION ---
+            // Detect companion elements (labels on objects, values near counters) via bbox overlap.
+            // Companions become 'overlay' with linkedAnchorId so they move with their parent.
+            // Computed on ALL layers so a missing companion can reference an AI-overridden anchor.
+            const fallbackProximity = new Map<string, string>(); // companion id -> anchor id
+            for (const layer of allLayers) {
+                if (!layer.isVisible) continue;
+                const role = inferLayoutRoleFromName(layer.name);
+                if (role === 'background') continue;
+
+                const layerArea = layer.coords.w * layer.coords.h;
+                let bestAnchor: { id: string; area: number } | null = null;
+
+                for (const candidate of allLayers) {
+                    if (candidate.id === layer.id || !candidate.isVisible) continue;
+                    const candRole = inferLayoutRoleFromName(candidate.name);
+                    if (candRole === 'background') continue;
+
+                    const candidateArea = candidate.coords.w * candidate.coords.h;
+                    // Anchor must be significantly larger (at least 1.5x area)
+                    if (candidateArea <= layerArea * 1.5) continue;
+
+                    // Check bounding box overlap
+                    const overlapX = Math.max(0,
+                        Math.min(layer.coords.x + layer.coords.w, candidate.coords.x + candidate.coords.w) -
+                        Math.max(layer.coords.x, candidate.coords.x));
+                    const overlapY = Math.max(0,
+                        Math.min(layer.coords.y + layer.coords.h, candidate.coords.y + candidate.coords.h) -
+                        Math.max(layer.coords.y, candidate.coords.y));
+                    const overlapArea = overlapX * overlapY;
+
+                    // Significant overlap: > 30% of the smaller layer's area
+                    if (overlapArea > layerArea * 0.3) {
+                        // Pick the smallest qualifying anchor (most specific parent)
+                        if (!bestAnchor || candidateArea < bestAnchor.area) {
+                            bestAnchor = { id: candidate.id, area: candidateArea };
+                        }
+                    }
+                }
+
+                if (bestAnchor) {
+                    fallbackProximity.set(layer.id, bestAnchor.id);
+                }
+            }
+
+            // Exclude companion layers from redistribution — they'll be placed by overlay solver
+            const independentFlowLayers = flowLayers.filter(l => !fallbackProximity.has(l.id));
+
+            // --- REDISTRIBUTION BAND DETECTION ---
+            // Not all flow layers belong in the same horizontal/vertical redistribution.
+            // Wide spanning elements (titles, headers) should keep proportional centering.
+            // Only elements at similar vertical positions form a redistribution band.
+            const SPANNING_THRESHOLD = 0.5; // element wider than 50% of source = spanning
+            const BAND_THRESHOLD = 0.25;    // Y-center must be within 25% of source height to be same band
+
+            const redistributableLayers: typeof independentFlowLayers = [];
+            const spanningLayers: typeof independentFlowLayers = [];
+
+            if (isPortraitToLandscape && independentFlowLayers.length > 1) {
+                // Find the vertical band with the most elements (the "main row")
+                const withCenter = independentFlowLayers.map(l => ({
+                    layer: l,
+                    cx: (l.coords.x + l.coords.w / 2 - sourceX) / sourceW,
+                    cy: (l.coords.y + l.coords.h / 2 - sourceY) / sourceH,
+                    widthRatio: l.coords.w / sourceW,
+                }));
+                // Wide spanning elements never redistribute
+                const nonSpanning = withCenter.filter(e => e.widthRatio <= SPANNING_THRESHOLD);
+                const spanning = withCenter.filter(e => e.widthRatio > SPANNING_THRESHOLD);
+                spanning.forEach(e => spanningLayers.push(e.layer));
+
+                if (nonSpanning.length > 1) {
+                    // Cluster by Y-center: find the Y-center with the most neighbors
+                    let bestBandY = nonSpanning[0].cy;
+                    let bestCount = 0;
+                    for (const e of nonSpanning) {
+                        const count = nonSpanning.filter(o => Math.abs(o.cy - e.cy) < BAND_THRESHOLD).length;
+                        if (count > bestCount) { bestCount = count; bestBandY = e.cy; }
+                    }
+                    for (const e of nonSpanning) {
+                        if (Math.abs(e.cy - bestBandY) < BAND_THRESHOLD) {
+                            redistributableLayers.push(e.layer);
+                        } else {
+                            spanningLayers.push(e.layer); // Outside main band → proportional
+                        }
+                    }
+                } else {
+                    nonSpanning.forEach(e => spanningLayers.push(e.layer));
+                }
+            } else if (isLandscapeToPortrait && independentFlowLayers.length > 1) {
+                // Mirror: tall spanning elements and horizontal band detection
+                const withCenter = independentFlowLayers.map(l => ({
+                    layer: l,
+                    cx: (l.coords.x + l.coords.w / 2 - sourceX) / sourceW,
+                    cy: (l.coords.y + l.coords.h / 2 - sourceY) / sourceH,
+                    heightRatio: l.coords.h / sourceH,
+                }));
+                const nonSpanning = withCenter.filter(e => e.heightRatio <= SPANNING_THRESHOLD);
+                const spanning = withCenter.filter(e => e.heightRatio > SPANNING_THRESHOLD);
+                spanning.forEach(e => spanningLayers.push(e.layer));
+
+                if (nonSpanning.length > 1) {
+                    let bestBandX = nonSpanning[0].cx;
+                    let bestCount = 0;
+                    for (const e of nonSpanning) {
+                        const count = nonSpanning.filter(o => Math.abs(o.cx - e.cx) < BAND_THRESHOLD).length;
+                        if (count > bestCount) { bestCount = count; bestBandX = e.cx; }
+                    }
+                    for (const e of nonSpanning) {
+                        if (Math.abs(e.cx - bestBandX) < BAND_THRESHOLD) {
+                            redistributableLayers.push(e.layer);
+                        } else {
+                            spanningLayers.push(e.layer);
+                        }
+                    }
+                } else {
+                    nonSpanning.forEach(e => spanningLayers.push(e.layer));
+                }
+            }
+
+            if (spanningLayers.length > 0) {
+                console.log(`[Analyst] Redistribution: ${redistributableLayers.length} row items, ${spanningLayers.length} spanning/outlier (proportional):`,
+                    spanningLayers.map(l => l.name).join(', '));
+            }
+
+            if (fallbackProximity.size > 0) {
+                console.log(`[Analyst] Spatial proximity detected ${fallbackProximity.size} companion layers:`,
+                    Array.from(fallbackProximity.entries()).map(([comp, anch]) => `${comp}→${anch}`).join(', '));
+            }
+
             for (const layer of missingLayers) {
                 const role = inferLayoutRoleFromName(layer.name);
                 const relX = (layer.coords.x - sourceX) / sourceW;
@@ -1560,6 +1774,21 @@ Think: 1) What's here? 2) How to arrange in ${targetW}x${targetH}? 3) What scale
                         layerId: layer.id,
                         layoutRole: role,
                         xOffset: relX * tgtW,
+                        yOffset: relY * tgtH,
+                        individualScale: proportionalScale,
+                    };
+                    json.overrides.push(override);
+                    continue;
+                }
+                // Companion layers (spatially overlapping a larger element) become overlays
+                // The Remapper overlay solver will position them relative to their anchor
+                const anchorLayerId = fallbackProximity.get(layer.id);
+                if (anchorLayerId && role !== 'background' && role !== 'static') {
+                    override = {
+                        layerId: layer.id,
+                        layoutRole: 'overlay',
+                        linkedAnchorId: anchorLayerId,
+                        xOffset: relX * tgtW,  // Initial position; overridden by Remapper overlay solver
                         yOffset: relY * tgtH,
                         individualScale: proportionalScale,
                     };
@@ -1590,35 +1819,38 @@ Think: 1) What's here? 2) How to arrange in ${targetW}x${targetH}? 3) What scale
                             vertical: relY < 0.33 ? 'top' : (relY > 0.66 ? 'bottom' : 'center'),
                         },
                     };
-                } else if ((isPortraitToLandscape || isLandscapeToPortrait) && flowLayers.length > 1) {
-                    // Geometry-shift-aware redistribution for flow/overlay layers
-                    const flowIndex = flowLayers.indexOf(layer);
+                } else if ((isPortraitToLandscape || isLandscapeToPortrait) && redistributableLayers.length > 1) {
+                    // Geometry-shift-aware redistribution for row items only.
+                    // Spanning/outlier elements get proportional centered positioning.
+                    const flowIndex = redistributableLayers.indexOf(layer);
                     if (flowIndex === -1) {
-                        // Shouldn't happen, fallback to proportional
+                        // Not in redistribution band — proportional positioning preserving source center
+                        const centerX = (layer.coords.x + layer.coords.w / 2 - sourceX) / sourceW;
+                        const centerY = (layer.coords.y + layer.coords.h / 2 - sourceY) / sourceH;
                         override = {
                             layerId: layer.id,
                             layoutRole: role,
-                            xOffset: relX * tgtW,
-                            yOffset: relY * tgtH,
+                            xOffset: Math.max(0, centerX * tgtW - layer.coords.w * proportionalScale / 2),
+                            yOffset: Math.max(0, centerY * tgtH - layer.coords.h * proportionalScale / 2),
                             individualScale: proportionalScale,
                         };
                     } else if (isPortraitToLandscape) {
-                        // Portrait→Landscape: distribute flow layers horizontally
+                        // Portrait→Landscape: distribute row items horizontally
                         const heightScale = tgtH / sourceH;
                         let fitScale = Math.min(heightScale, proportionalScale * 1.2); // Allow slightly larger than proportional
-                        let totalFlowWidth = flowLayers.reduce((sum, l) => sum + l.coords.w * fitScale, 0);
+                        let totalFlowWidth = redistributableLayers.reduce((sum, l) => sum + l.coords.w * fitScale, 0);
                         const availableWidth = tgtW;
                         // If content exceeds available space, shrink to fit with margin for gaps
                         if (totalFlowWidth > availableWidth * 0.9) {
                             fitScale = fitScale * (availableWidth * 0.85) / totalFlowWidth;
-                            totalFlowWidth = flowLayers.reduce((sum, l) => sum + l.coords.w * fitScale, 0);
+                            totalFlowWidth = redistributableLayers.reduce((sum, l) => sum + l.coords.w * fitScale, 0);
                         }
                         const gapTotal = availableWidth - totalFlowWidth;
-                        const gap = Math.max(0, gapTotal / (flowLayers.length + 1));
+                        const gap = Math.max(0, gapTotal / (redistributableLayers.length + 1));
                         // Calculate cumulative x position
                         let cumulativeX = gap;
                         for (let i = 0; i < flowIndex; i++) {
-                            cumulativeX += flowLayers[i].coords.w * fitScale + gap;
+                            cumulativeX += redistributableLayers[i].coords.w * fitScale + gap;
                         }
                         override = {
                             layerId: layer.id,
@@ -1628,21 +1860,21 @@ Think: 1) What's here? 2) How to arrange in ${targetW}x${targetH}? 3) What scale
                             individualScale: fitScale,
                         };
                     } else {
-                        // Landscape→Portrait: distribute flow layers vertically
+                        // Landscape→Portrait: distribute row items vertically
                         const widthScale = tgtW / sourceW;
                         let fitScale = Math.min(widthScale, proportionalScale * 1.2);
-                        let totalFlowHeight = flowLayers.reduce((sum, l) => sum + l.coords.h * fitScale, 0);
+                        let totalFlowHeight = redistributableLayers.reduce((sum, l) => sum + l.coords.h * fitScale, 0);
                         const availableHeight = tgtH;
                         // If content exceeds available space, shrink to fit with margin for gaps
                         if (totalFlowHeight > availableHeight * 0.9) {
                             fitScale = fitScale * (availableHeight * 0.85) / totalFlowHeight;
-                            totalFlowHeight = flowLayers.reduce((sum, l) => sum + l.coords.h * fitScale, 0);
+                            totalFlowHeight = redistributableLayers.reduce((sum, l) => sum + l.coords.h * fitScale, 0);
                         }
                         const gapTotal = availableHeight - totalFlowHeight;
-                        const gap = Math.max(0, gapTotal / (flowLayers.length + 1));
+                        const gap = Math.max(0, gapTotal / (redistributableLayers.length + 1));
                         let cumulativeY = gap;
                         for (let i = 0; i < flowIndex; i++) {
-                            cumulativeY += flowLayers[i].coords.h * fitScale + gap;
+                            cumulativeY += redistributableLayers[i].coords.h * fitScale + gap;
                         }
                         override = {
                             layerId: layer.id,

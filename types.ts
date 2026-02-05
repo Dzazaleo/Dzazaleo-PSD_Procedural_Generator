@@ -206,6 +206,13 @@ export interface SourceAnalysis {
   mustPreserve: string[];      // What MUST be maintained (e.g., ["all 3 choices visible", "equal visual weight"])
   canAdapt: string[];          // What can be rearranged (e.g., ["potion formation", "spacing"])
   canScale: string[];          // What can be scaled down (e.g., ["prize labels", "decorative elements"])
+
+  // Semantic groupings (which elements move together)
+  semanticGroups?: {
+    anchor: string;            // Main element in the group (e.g., "potion_red")
+    companions: string[];      // Elements that should stay with the anchor (e.g., ["1300_label"])
+    relationship: string;      // How they relate (e.g., "prize label on object")
+  }[];
 }
 
 export interface VerificationIssue {

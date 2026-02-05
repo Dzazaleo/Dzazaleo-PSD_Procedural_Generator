@@ -78,6 +78,7 @@ LoadPSD → DesignInfo/TemplateSplitter → ContainerResolver → DesignAnalyst 
 - `LayoutStrategy`: AI-generated layout instructions (method, scale, anchor, per-layer overrides)
 - `LayerOverride`: Per-layer transform with `scaleX`/`scaleY` (non-uniform), `edgeAnchor` (edge pinning for UI), and `layoutRole` (flow/static/overlay/background)
 - `ContainerDefinition`: Template container with absolute and normalized bounds
+- `SourceAnalysis`: Stage 1 comprehension output including `semanticGroups` — groups of visually paired elements (anchor + companions) that must move together during layout recomposition
 
 ### PSD Template Convention
 
@@ -173,24 +174,33 @@ Layout strategies include confidence triangulation (`TriangulationAudit`) with v
 - Server health indicator for Ollama connections (checking/online/offline)
 - Multi-instance support for parallel container analysis
 - **3-Stage AI Pipeline:**
-  - Stage 1 (Source Comprehension): Semantic understanding of source content (narrative, elements, arrangement)
-  - Stage 2 (Layout Generation): Per-layer layout strategy with role-based scaling
+  - Stage 1 (Source Comprehension): Semantic understanding of source content — narrative, elements, arrangement, and **semantic groupings** (which elements are visually paired and must move together)
+  - Stage 2 (Layout Generation): Per-layer layout strategy with role-based scaling. Receives semantic groups from Stage 1 and spatial proximity annotations (`near:ID`) from bounding box overlap analysis
   - Stage 3 (Semantic Verification): Cross-checks layout preserves original composition intent
 - Generates `LayoutStrategy` with: method (GEOMETRIC/GENERATIVE/HYBRID), spatial layout, per-layer overrides
+- **Semantic Grouping System:**
+  - Stage 1 identifies anchor-companion relationships (e.g., prize labels on potions, values near counters)
+  - Stage 2 receives these as context + spatial proximity data computed from layer bounding box overlaps (>30% area overlap with ≥1.5x size ratio)
+  - Companion layers should be assigned `overlay` role with `linkedAnchorId` pointing to their anchor
+  - The Remapper overlay solver positions companions relative to their anchor's new position using source-space deltas
 - **Per-layer override generation:** AI must produce an override for EVERY layer, classifying each by semantic role:
   - `background`: Stretch to fill target (non-uniform `scaleX`/`scaleY`)
   - `flow`: Proportional positioning and uniform scaling
   - `static`: Edge-pinned UI elements with `edgeAnchor` (horizontal/vertical pin)
-  - `overlay`: Positioned relative to parent via `linkedAnchorId`
-- **Override validation:** If AI misses layers, `inferLayoutRoleFromName()` generates sensible defaults based on layer name patterns (bg→background, win/counter→static, etc.)
+  - `overlay`: Positioned relative to parent via `linkedAnchorId` — used for companion elements that must move with their anchor
+- **Override validation & default fallback:**
+  - If AI misses layers, `inferLayoutRoleFromName()` generates defaults based on name patterns (bg→background, win/counter/text→static, label/badge→overlay, etc.)
+  - Invisible layers (`isVisible: false`) are excluded from redistribution
+  - Spatial proximity detection runs on ALL layers in fallback — companions are auto-assigned `overlay` + `linkedAnchorId`
+  - Only `independentFlowLayers` (non-companion flow elements) participate in gap-based redistribution
+  - Negative gap protection: when content exceeds target width, `fitScale` is reduced to fit with margin
 - Confidence triangulation via visual, knowledge, and metadata vectors
 - Knowledge integration: scopes rules per container, respects mute toggle
 - Draft generation disabled (requires ComfyUI integration)
 - **Token optimization for local models:**
   - Depth-limited layer flattening (`MAX_LAYER_DEPTH=3`) prevents token explosion on nested containers
   - Layer sample capped at `MAX_LAYERS_IN_PROMPT=20` for comprehensive container coverage
-  - Image detail set to 'high' for full resolution analysis
-  - All visual anchors included for complete style reference
+  - Stage 2 schema uses minimal required fields to prevent JSON truncation on local models
 - **Persistence optimization:** `sourceReference` (base64 image) stripped from stored state to prevent project file bloat
 - **Configuration constants** (defined at module scope):
   - `ASPECT_RATIO_TOLERANCE=0.15`: Threshold for detecting geometry shift between source/target
@@ -280,13 +290,6 @@ Layout strategies include confidence triangulation (`TriangulationAudit`) with v
 
 ### Troubleshooting
 
-#### Vite/Build Issues
-
-**"Failed to resolve dependency" errors for monaco-editor:**
-- Monaco Editor is not used in this project
-- If `vite.config.ts` contains `optimizeDeps.include` entries for Monaco workers, remove them
-- The config should not reference any monaco-editor paths
-
 #### Local Ollama Issues
 
 **"GGML_ASSERT(a->ne[2] * 4 == b->ne[0]) failed" errors with qwen2.5vl:**
@@ -304,34 +307,17 @@ Start-Process "$env:TEMP\OllamaSetup-0.12.11.exe" -Wait
 ollama --version  # Should show 0.12.11
 ```
 
-With Ollama 0.12.11, qwen2.5vl:7b works reliably with full inference limits:
-- Images at 512px resolution
-- Up to 8 images per request
-- 16384 token context window
-- 20 layers in prompts
-- High detail image analysis
+With Ollama 0.12.11, qwen2.5vl:7b works reliably with full inference limits (512px images, 8 images/request, 16384 context, 20 layers/prompt).
 
-**If you must use Ollama 0.13.x+:**
-The GGML bug requires conservative workarounds - reduce `MAX_IMAGE_DIMENSION` to 384, `MAX_IMAGES_PER_REQUEST` to 2, `num_ctx` to 8192, and `MAX_LAYERS_IN_PROMPT` to 12 in the code.
-
-**Model crashes with nested layer containers:**
-- Depth-limited flattening is applied (`MAX_LAYER_DEPTH=3`)
-- Layer count is capped at `MAX_LAYERS_IN_PROMPT=20` per analysis
-- Check browser console for `[Qwen]` debug logs showing request size
-- Constants can be adjusted in `DesignAnalystNode.tsx` if needed for specific hardware
-
-**Large project file sizes after analysis:**
-- Fixed: `sourceReference` base64 data is now stripped from persisted state
-- If old projects are bloated, re-run analysis to update stored strategies
+**If you must use Ollama 0.13.x+:** reduce `MAX_IMAGE_DIMENSION` to 384, `MAX_IMAGES_PER_REQUEST` to 2, `num_ctx` to 8192, and `MAX_LAYERS_IN_PROMPT` to 12 in the code.
 
 **Ollama server debugging:**
 ```powershell
 $env:OLLAMA_DEBUG="1"; ollama serve
 ```
-This enables verbose server-side logging to diagnose crashes.
 
 **Analysis failures:**
 - DesignAnalystNode displays error messages directly in the UI (red banner below chat)
-- Check browser console for detailed error stack traces
-- Common causes: network timeouts, malformed AI responses, missing source/target data
-- AI response validation provides sensible defaults if required fields are missing
+- Check browser console for `[Qwen]` debug logs and error stack traces
+- AI response validation and `repairTruncatedJson` provide recovery for malformed/truncated responses
+- Default fallback generates sensible overrides if AI misses layers
