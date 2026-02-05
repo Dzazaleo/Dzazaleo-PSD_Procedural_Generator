@@ -29,9 +29,12 @@ const DRAFT_DEBOUNCE_MS = 500;
 const inferLayoutRoleFromName = (name: string): 'flow' | 'static' | 'overlay' | 'background' => {
   const lower = name.toLowerCase();
   if (lower.includes('bg') || lower.includes('background') || lower.includes('fill')) return 'background';
-  if (lower.includes('button') || lower.includes('cta') || lower.includes('win') ||
+  if (lower.includes('button') || lower.includes('cta') ||
       lower.includes('counter') || lower.includes('score') || lower.includes('header') ||
-      lower.includes('footer') || lower.includes('nav')) return 'static';
+      lower.includes('footer') || lower.includes('nav') ||
+      lower.includes('window') || lower.includes('winner_counter') ||
+      lower === 'win' || lower.startsWith('win ') ||
+      lower === 'text' || lower.startsWith('text ')) return 'static';
   if (lower.includes('label') || lower.includes('badge') || lower.includes('tag')) return 'overlay';
   return 'flow';
 };
@@ -950,80 +953,40 @@ Focus on UNDERSTANDING, not layout decisions.`;
     layoutStrategy: LayoutStrategy,
     sourceImage: string,
     targetW: number,
-    targetH: number
+    targetH: number,
+    sourceLayers?: { id: string; name: string; coords: { x: number; y: number; w: number; h: number } }[]
   ): Promise<VerificationResult> => {
-    const verificationPrompt = `You are a design QA specialist. Your task is to verify that a proposed layout preserves the original composition's intent.
+    // Build layer dimension reference table so Stage 3 knows actual sizes
+    const layerDimTable = sourceLayers && sourceLayers.length > 0
+      ? `\nLAYER DIMENSIONS (for coordinate validation):\n${sourceLayers.map(l => `${l.id} ${l.name}: ${l.coords.w}x${l.coords.h} at (${l.coords.x},${l.coords.y})`).join('\n')}\n`
+      : '';
 
-═══════════════════════════════════════════════════════════════════════════════
-ORIGINAL COMPOSITION ANALYSIS
-═══════════════════════════════════════════════════════════════════════════════
-NARRATIVE: ${sourceAnalysis.narrative}
-USER EXPERIENCE: ${sourceAnalysis.userExperience}
-PRIMARY ELEMENTS: ${sourceAnalysis.primaryElements.join(', ')}
-ATTENTION ORDER: ${sourceAnalysis.attentionOrder.join(' → ')}
-MUST PRESERVE: ${sourceAnalysis.mustPreserve.join('; ')}
+    // Compact override summary (only key fields to save tokens)
+    const overrideSummary = (layoutStrategy.overrides || []).map(o =>
+      `${o.layerId}: role=${o.layoutRole}, pos=(${Math.round(o.xOffset)},${Math.round(o.yOffset)}), scale=${o.individualScale?.toFixed(2) || '1.00'}${o.scaleX ? ` scaleXY=(${o.scaleX.toFixed(2)},${o.scaleY?.toFixed(2)})` : ''}`
+    ).join('\n');
 
-═══════════════════════════════════════════════════════════════════════════════
-PROPOSED LAYOUT
-═══════════════════════════════════════════════════════════════════════════════
-Target: ${targetW}x${targetH}px
-Scale: ${layoutStrategy.suggestedScale}x
-Layout Mode: ${layoutStrategy.spatialLayout || 'UNIFIED_FIT'}
-Method: ${layoutStrategy.method}
+    const verificationPrompt = `You are a design QA specialist verifying a layout preserves the original composition.
 
-Layer Overrides:
-${JSON.stringify(layoutStrategy.overrides || [], null, 2)}
+ORIGINAL: ${sourceAnalysis.narrative}
+Primary: ${sourceAnalysis.primaryElements.join(', ')}
+Attention: ${sourceAnalysis.attentionOrder.join(' → ')}
+Must preserve: ${sourceAnalysis.mustPreserve.join('; ')}
 
-═══════════════════════════════════════════════════════════════════════════════
-VERIFICATION CHECKLIST
-═══════════════════════════════════════════════════════════════════════════════
-Answer YES or NO with explanation:
+PROPOSED LAYOUT: Target ${targetW}x${targetH}, scale=${layoutStrategy.suggestedScale}x, mode=${layoutStrategy.spatialLayout || 'UNIFIED_FIT'}
+${overrideSummary}
+${layerDimTable}
+VERIFY (YES/NO each):
+1. Narrative preserved? Story still clear?
+2. Hierarchy maintained? "${sourceAnalysis.dominantElement}" still dominates?
+3. All elements visible? No cropping/off-screen? (Check: xOffset >= 0, yOffset >= 0, xOffset + layerWidth*scale <= ${targetW}, yOffset + layerHeight*scale <= ${targetH})
+4. Visual balance? Evenly distributed?
+5. Scale appropriate? Text readable?
 
-1. NARRATIVE PRESERVED: Does the layout still tell the same story?
-   - Can the user still understand the purpose?
-   - Is the message clear?
+IF ISSUES: Provide correctedOverrides with ABSOLUTE xOffset/yOffset (from target top-left 0,0).
+All coordinates must be >= 0 and fit within ${targetW}x${targetH}.
 
-2. HIERARCHY MAINTAINED: Is the attention order preserved?
-   - Does "${sourceAnalysis.dominantElement}" still dominate?
-   - Do eyes flow in the intended order?
-
-3. ALL ELEMENTS VISIBLE: Will every element from "mustPreserve" be fully visible?
-   - No cropping?
-   - No off-screen elements?
-
-4. BALANCE: Is visual balance maintained?
-   - Elements evenly distributed?
-   - No awkward empty spaces?
-
-5. SCALE APPROPRIATE: At ${layoutStrategy.suggestedScale}x scale:
-   - Are primary elements still prominent enough?
-   - Is text still readable?
-
-═══════════════════════════════════════════════════════════════════════════════
-IF ISSUES FOUND - PROVIDE CORRECTIONS
-═══════════════════════════════════════════════════════════════════════════════
-If any check fails, you MUST provide corrected overrides.
-
-OVERRIDE COORDINATE SYSTEM:
-- xOffset/yOffset are ABSOLUTE positions relative to target container's top-left (0,0)
-- NOT relative offsets from original position
-- Each override completely REPLACES the geometric baseline
-
-Example for horizontal distribution in ${targetW}x${targetH} target:
-If 3 items need horizontal arrangement with 50px padding:
-- Item 1: xOffset = 50 + (itemWidth/2)
-- Item 2: xOffset = ${targetW}/2
-- Item 3: xOffset = ${targetW} - 50 - (itemWidth/2)
-
-Provide correctedOverrides with specific xOffset/yOffset values that fix the issues.
-
-═══════════════════════════════════════════════════════════════════════════════
-OUTPUT
-═══════════════════════════════════════════════════════════════════════════════
-If ALL checks pass: { "passed": true, "confidenceScore": 0.9, ... }
-If ANY check fails: { "passed": false, "issues": [...], "correctedOverrides": [...], ... }
-
-Respond with JSON matching the VerificationResult schema.`;
+Output JSON: { "passed": bool, "issues": [...], "correctedOverrides": [...] (if needed), "confidenceScore": 0-1 }`;
 
     const verificationSchema: StructuredOutputSchema = {
       type: 'object',
@@ -1162,200 +1125,81 @@ Respond with JSON matching the VerificationResult schema.`;
         ? `GEOMETRY SHIFT: ${sourceOrientation} -> ${targetOrientation}. You must RECOMPOSE the layout, not just scale it.`
         : `Geometry stable: similar aspect ratios.`;
 
-    // Expert Designer Persona - Constraint-First Design Philosophy
-    const expertPersona = `You are a Senior Art Director with 15 years of experience in adaptive layout design. You specialize in translating design assets across different aspect ratios and formats while preserving visual hierarchy and brand integrity.
+    // Expert Designer Persona - Compact constraint-first design philosophy
+    const expertPersona = `You are a Senior Art Director specializing in adaptive layout across aspect ratios.
 
-YOUR CORE PHILOSOPHY - CONSTRAINT-FIRST DESIGN:
-1. CONSTRAINTS ARE NON-NEGOTIABLE - Rules, spacing requirements, and target dimensions are hard boundaries
-2. VISUAL HIERARCHY IS SACRED - The eye must flow: Primary → Secondary → Tertiary → Background
-3. EVERY DECISION NEEDS JUSTIFICATION - If you can't cite why, don't do it
-4. WHEN IN DOUBT, PRESERVE READABILITY - Legibility beats aesthetics
+RULES:
+1. Constraints are non-negotiable (target dims, design rules, anchors)
+2. Visual hierarchy: Primary → Secondary → Tertiary → Background
+3. Every decision needs justification via citedRule
+4. Readability beats aesthetics
 
-YOUR DECISION PROCESS (follow this ORDER):
-┌─────────────────────────────────────────────────────────────────┐
-│ STEP 1: READ ALL CONSTRAINTS                                     │
-│         - Target dimensions (hard limit)                         │
-│         - Design rules from KnowledgeNode (must apply)           │
-│         - Visual anchor patterns (must match)                    │
-├─────────────────────────────────────────────────────────────────┤
-│ STEP 2: VERIFY CONSTRAINTS ARE SATISFIABLE                       │
-│         - Can all rules be applied simultaneously?               │
-│         - If conflict exists, document it in reasoning           │
-├─────────────────────────────────────────────────────────────────┤
-│ STEP 3: ESTABLISH VISUAL HIERARCHY                               │
-│         - Which element demands attention first?                 │
-│         - What's the reading order?                              │
-│         - What can be scaled down (NEVER cropped)?               │
-├─────────────────────────────────────────────────────────────────┤
-│ STEP 4: CALCULATE GEOMETRY                                       │
-│         - Scale factor that satisfies ALL constraints            │
-│         - Position offsets for constraint compliance             │
-│         - Verify: does result maintain hierarchy?                │
-├─────────────────────────────────────────────────────────────────┤
-│ STEP 5: FINAL VERIFICATION                                       │
-│         - Every rule cited in rulesApplied? ✓                    │
-│         - Every constraint satisfied? ✓                          │
-│         - Visual hierarchy preserved? ✓                          │
-└─────────────────────────────────────────────────────────────────┘
+PROCESS: Read constraints → Verify satisfiable → Establish hierarchy → Calculate geometry → Verify fit
 
-ACCOUNTABILITY:
-- If you ignore a constraint, your output is INVALID
-- If you can't apply a rule, explain WHY in reasoning (e.g., "Rule X conflicts with target dimensions")
-- If visual hierarchy is broken, document the tradeoff made
-
-VISUAL HIERARCHY PRINCIPLES:
-- Size creates dominance (larger = more important)
-- Position creates flow (top-left → bottom-right in LTR cultures)
-- Contrast creates focus (high contrast = attention)
-- Whitespace creates breathing room (don't cram)
-- Alignment creates order (misalignment = chaos)
-
-GEOMETRY SHIFT PROTOCOL (when source and target aspect ratios differ significantly):
-Portrait → Landscape: REARRANGE elements horizontally. Stack elements side-by-side instead of vertically.
-Landscape → Portrait: REARRANGE elements vertically. Stack elements top-to-bottom instead of side-by-side.
-DO NOT just scale and crop. RECOMPOSE the layout to use the new space effectively.
-
-Example: 3 potions + title in portrait (1080x1920) → landscape (1280x1024)
-WRONG: Scale 0.53x and crop third potion off-screen
-RIGHT: Title centered at top, 3 potions arranged horizontally below using landscape width
+GEOMETRY SHIFT (when aspect ratios differ):
+Portrait→Landscape: REARRANGE horizontally, spread elements side-by-side
+Landscape→Portrait: REARRANGE vertically, stack top-to-bottom
+NEVER just scale+crop. RECOMPOSE the layout for the new space.
+Example: 3 items + title in portrait → landscape = title at top, 3 items arranged in a row below
 
 HARD RULES:
-- NOTHING may be cropped or off-screen - all content must be visible
-- Text elements (titles, labels) must be CENTERED unless rules specify otherwise
-- Elements must be distributed with visual balance (not bunched to one side)
-- If content doesn't fit at 1.0x scale, calculate the scale that makes EVERYTHING fit
-
-When constraints and aesthetics conflict, CONSTRAINTS WIN.
-When two constraints conflict, the EXPLICIT RULE wins over implicit assumptions.
+- NOTHING cropped or off-screen
+- Text CENTERED unless rules say otherwise
+- Visual balance (not bunched to one side)
+- If content doesn't fit at 1.0x, reduce scale until EVERYTHING fits
+- Constraints win over aesthetics; explicit rules win over assumptions
 `;
 
-    // STEP 1: Visual Analysis Section (forces model to describe what it sees)
+    // Visual Analysis Section (only used when Stage 1 comprehension is missing)
     const visualAnalysisSection = `
-═══════════════════════════════════════════════════════════════════════════════
-STEP 1: VISUAL ANALYSIS (REQUIRED - Complete BEFORE making layout decisions)
-═══════════════════════════════════════════════════════════════════════════════
-Examine the INPUT SOURCE CONTEXT image and describe IN YOUR OUTPUT:
-
-1. CONTENT INVENTORY: List every distinct visual element you see
-   - Text elements: headlines, subheadings, body copy, labels
-   - Graphics: logos, icons, illustrations, photos
-   - Decorative: borders, shadows, gradients, patterns
-   - Background: solid colors, textures, images
-
-2. SPATIAL RELATIONSHIPS: How are elements arranged?
-   - Visual hierarchy (most prominent to least)
-   - Alignment patterns (left, center, grid)
-   - Spacing patterns (uniform, varied, grouped)
-
-3. STYLE CHARACTERISTICS: What defines the visual style?
-   - Color palette (list dominant colors)
-   - Typography style (serif/sans-serif, weights)
-   - Overall mood (corporate, playful, minimal, bold)
-
-Your "visualAnalysis" field MUST contain image-specific details, not generic descriptions.
+VISUAL ANALYSIS (REQUIRED):
+Examine the source image. In "visualAnalysis" describe:
+1. Every visual element (text, graphics, decorative, background)
+2. Spatial arrangement (hierarchy, alignment, spacing)
+3. Style (colors, typography, mood)
+Be specific to THIS image, not generic.
 `;
 
-    // STEP 2: Knowledge Rules Section (strengthened with citation enforcement)
+    // Knowledge Rules Section
     const knowledgeSection = effectiveRules ? `
-═══════════════════════════════════════════════════════════════════════════════
-STEP 2: MANDATORY DESIGN RULES (MUST APPLY - Cite each rule)
-═══════════════════════════════════════════════════════════════════════════════
-The following rules are NON-NEGOTIABLE. For EACH rule you MUST:
-- Apply it to your layout decisions
-- Add it to the "rulesApplied" array with explanation
-
+MANDATORY DESIGN RULES (cite each in rulesApplied):
 <RULES>
 ${effectiveRules}
 </RULES>
-
-RULE APPLICATION GUIDE:
-- "LAYOUT_METHOD: X" -> Set layoutMode to X
-- "SPACING: Npx" -> Calculate scale ensuring N pixels clearance
-- "HIERARCHY: A over B" -> Layer A must be visually prominent over B
-- "UI_RESERVES: Lock X" -> That element gets layoutRole="static"
-
-EVERY override that implements a rule must include "citedRule" field.
-FAILURE TO CITE RULES = OUTPUT REJECTED
+Every override implementing a rule must include "citedRule". Uncited rules = invalid output.
 ` : '';
 
-    // Visual Anchor Context Section (explains anchors before images appear)
+    // Visual Anchor Context Section
     const anchorSection = effectiveKnowledge?.visualAnchors?.length ? `
-═══════════════════════════════════════════════════════════════════════════════
-VISUAL ANCHOR COMPLIANCE (Match style to reference images)
-═══════════════════════════════════════════════════════════════════════════════
-You will see ${effectiveKnowledge.visualAnchors.length} VISUAL_ANCHOR image(s) below.
-These are AUTHORITATIVE style references.
-
-For each anchor, analyze and apply:
-- Layout patterns (grid, stack, centered)
-- Spacing and alignment conventions
-- Visual style elements (colors, typography feel)
-
-Reference anchors by index in your overrides (anchorIndex field).
+VISUAL ANCHORS: ${effectiveKnowledge.visualAnchors.length} reference image(s) follow. Match layout/spacing/style. Use anchorIndex in overrides.
 ` : '';
 
-    // Layer Data Section (with semantic role hints)
+    // Layer Data Section (compact table format to save tokens)
+    const layerRows = layerAnalysisData.slice(0, MAX_LAYERS_IN_PROMPT).map(l =>
+      `${l.id} | ${l.name} | ${l.relX.toFixed(2)},${l.relY.toFixed(2)} | ${l.width}x${l.height} | ${l.type}${l.childCount > 0 ? ` (${l.childCount}ch)` : ''}`
+    ).join('\n');
     const layerDataSection = `
-═══════════════════════════════════════════════════════════════════════════════
-LAYER DATA (Analyze PURPOSE, not just position)
-═══════════════════════════════════════════════════════════════════════════════
-For each layer, determine its SEMANTIC ROLE from name/position:
-- "background": bg, background, fill -> layoutRole="background"
-- "primary": title, headline, hero -> most important content
-- "secondary": subtitle, desc -> supporting content
-- "ui": button, cta, nav -> layoutRole="static"
-- "decorative": border, shadow, accent -> may scale differently
-
-LAYER INVENTORY (${Math.min(MAX_LAYERS_IN_PROMPT, layerAnalysisData.length)} of ${layerAnalysisData.length} layers):
-${JSON.stringify(layerAnalysisData.slice(0, MAX_LAYERS_IN_PROMPT))}
+LAYERS (${layerAnalysisData.length} total, showing ${Math.min(MAX_LAYERS_IN_PROMPT, layerAnalysisData.length)}):
+Classify each by name: bg/background/fill→"background", button/cta/nav→"static", label/badge→"overlay", else→"flow"
+ID | Name | RelX,RelY | WxH | Type
+${layerRows}
 `;
 
-    // Per-Layer Strategy Section (REQUIRED for every layer)
+    // Per-Layer Strategy Section (compact)
+    const proportionalScale = Math.min(targetW/sourceW, targetH/sourceH);
     const perLayerSection = `
-═══════════════════════════════════════════════════════════════════════════════
-PER-LAYER LAYOUT STRATEGY (REQUIRED FOR EVERY LAYER)
-═══════════════════════════════════════════════════════════════════════════════
-You MUST generate an override for EVERY layer in the LAYER INVENTORY above.
-Each layer must be CLASSIFIED and given appropriate scale/position for its role.
+PER-LAYER OVERRIDES (one override per layer, NO EXCEPTIONS):
 
-ROLE DEFINITIONS AND TRANSFORM BEHAVIORS:
+Role behaviors:
+- "background": stretch to fill. scaleX=${(targetW/sourceW).toFixed(3)}, scaleY=${(targetH/sourceH).toFixed(3)}, xOffset=0, yOffset=0
+- "flow": proportional positioning. scale=${proportionalScale.toFixed(3)}, position = relativePos × targetDims
+- "static": edge-pinned UI. scale~1.0, use edgeAnchor {horizontal,vertical}
+- "overlay": attached to parent via linkedAnchorId, scales with parent
 
-▸ "background" - Full-bleed fills, textures, base images
-  - ALWAYS stretch to fill entire target container (non-uniform scaling OK)
-  - scaleX = ${targetW} / layerWidth
-  - scaleY = ${targetH} / layerHeight
-  - xOffset = 0, yOffset = 0 (fills from top-left)
+Source ${sourceW}x${sourceH} → Target ${targetW}x${targetH}
+Proportional scale: ${proportionalScale.toFixed(3)}
 
-▸ "flow" - Main content (game elements, images, text blocks)
-  - MAINTAIN relative position within container
-  - Scale proportionally (uniform scaleX = scaleY)
-  - Position = (originalRelativePosition × targetDimensions)
-  - Example: Element at 30% from left stays at 30% from left
-
-▸ "static" - UI elements (buttons, counters, labels, headers)
-  - PIN to relative edge distances using edgeAnchor
-  - edgeAnchor: {horizontal: 'left'|'center'|'right', vertical: 'top'|'center'|'bottom'}
-  - Keep similar size (scale ~1.0) to maintain legibility
-  - Example: WIN counter 100px from bottom in ${sourceH}px source → ${Math.round(100 * targetH / sourceH)}px from bottom in ${targetH}px target
-
-▸ "overlay" - Elements attached to other layers (labels on images, badges)
-  - Specify linkedAnchorId (the parent layer's id)
-  - Position relative to parent layer
-  - Scale with parent
-
-CALCULATION FORMULAS:
-
-For source ${sourceW}x${sourceH} → target ${targetW}x${targetH}:
-- Aspect scale: ${(targetW/sourceW).toFixed(3)} horizontal, ${(targetH/sourceH).toFixed(3)} vertical
-- Background: scaleX=${(targetW/sourceW).toFixed(3)}, scaleY=${(targetH/sourceH).toFixed(3)}
-- Content proportional scale: ${Math.min(targetW/sourceW, targetH/sourceH).toFixed(3)}
-
-For a layer at relX=0.3, relY=0.5 (from source top-left):
-- New position: xOffset = ${Math.round(0.3 * targetW)}, yOffset = ${Math.round(0.5 * targetH)}
-
-OUTPUT REQUIREMENT:
-The "overrides" array MUST contain one entry for EVERY layer in the inventory.
-Each override MUST have: layerId, layoutRole, xOffset, yOffset, and scale values.
+Each override MUST have: layerId, layoutRole, xOffset, yOffset, individualScale.
 Missing layers = INVALID OUTPUT.
 `;
 
@@ -1379,35 +1223,17 @@ ${targetW > targetH ? 'Target is LANDSCAPE - spread elements horizontally.' : 'T
 Your visualAnalysis must mention: ${sourceAnalysis.primaryElements.slice(0, 3).join(', ')}
 ` : '';
 
-    // Constraint verification checklist
+    // Constraint verification (compact)
     const constraintVerification = `
-═══════════════════════════════════════════════════════════════════════════════
-CONSTRAINT VERIFICATION CHECKLIST (Complete before outputting)
-═══════════════════════════════════════════════════════════════════════════════
-Before finalizing your response, verify:
-
-□ ALL CONTENT VISIBLE: Will EVERY element from the source be visible in the target? (NO cropping allowed)
-□ TARGET BOUNDS: Does scaled content fit within ${targetW}x${targetH}? If not, reduce suggestedScale.
-□ TEXT CENTERED: Are title/text elements horizontally centered (unless rules say otherwise)?
-□ VISUAL BALANCE: Are elements distributed evenly, not bunched to one side?
-□ GEOMETRY SHIFT: If aspect ratio changed significantly, did you RECOMPOSE (not just scale)?
-□ PADDING RULES: If rules specify padding, is suggestedScale adjusted to leave that clearance?
-□ RULE COVERAGE: Is every rule from <RULES> block cited in rulesApplied array?
-
-If ANY check fails, adjust your output before responding.
-
-CRITICAL: If you would crop content to fit, STOP. Reduce scale or recompose layout instead.
+VERIFY BEFORE OUTPUT:
+- All content visible (no cropping)? Fits in ${targetW}x${targetH}?
+- Text centered? Visual balance? Geometry recomposed (not just scaled)?
+- All rules cited? If ANY fails, adjust before responding.
 `;
 
     const prompt = `${expertPersona}
-
-═══════════════════════════════════════════════════════════════════════════════
-CURRENT TASK
-═══════════════════════════════════════════════════════════════════════════════
-Source Container: "${sourceData.container.containerName}" (${sourceW}x${sourceH}px)
-Target Container: "${targetData.name}" (${targetW}x${targetH}px)
+TASK: "${sourceData.container.containerName}" (${sourceW}x${sourceH}) → "${targetData.name}" (${targetW}x${targetH})
 ${geometryContext}
-
 ${constraintSummary}
 ${sourceComprehensionSection}
 ${sourceAnalysis ? '' : visualAnalysisSection}
@@ -1415,65 +1241,19 @@ ${knowledgeSection}
 ${anchorSection}
 ${layerDataSection}
 ${perLayerSection}
-═══════════════════════════════════════════════════════════════════════════════
-YOUR DECISIONS (Apply your constraint-first methodology)
-═══════════════════════════════════════════════════════════════════════════════
+DECISIONS:
+1. spatialLayout: "UNIFIED_FIT" (scale+center) | "STRETCH_FILL" (fill container) | "ABSOLUTE_PIN" (exact positions)
+2. layoutMode: "STANDARD" | "GRID" | "DISTRIBUTE_HORIZONTAL" | "DISTRIBUTE_VERTICAL"
+3. Classify each layer role: flow/static/overlay/background
+4. suggestedScale: min scale so ALL content fits (account for padding rules)
+5. overrides: one per layer with layerId, xOffset, yOffset, individualScale, layoutRole
 
-1. SPATIAL LAYOUT (pick ONE):
-   - "UNIFIED_FIT" (default) - Scale all content as one unit, maintain aspect ratio, center it
-   - "STRETCH_FILL" - For backgrounds/textures that should fill the entire container
-   - "ABSOLUTE_PIN" - For UI elements that need exact positioning (requires xOffset/yOffset)
-
-2. LAYOUT MODE (if rules specify distribution):
-   - "STANDARD" - No special distribution
-   - "GRID" - Distribute elements in a grid pattern
-   - "DISTRIBUTE_HORIZONTAL" - Space elements evenly horizontally
-   - "DISTRIBUTE_VERTICAL" - Space elements evenly vertically
-
-3. LAYER ROLES (classify each major layer):
-   - "flow" - Part of the main content, participates in grid/distribution
-   - "static" - Fixed UI element (headers, titles) - doesn't move with grid
-   - "overlay" - Attached to another layer (MUST specify linkedAnchorId)
-   - "background" - Full-bleed texture at bottom of stack
-
-4. SCALE CALCULATION:
-   - Calculate suggestedScale so ALL content fits within target bounds
-   - If rules specify padding (e.g., "50px from edges"), account for it:
-     availableWidth = targetW - (2 x padding)
-   - Scale = min(availableWidth / contentWidth, availableHeight / contentHeight)
-   - NEVER choose a scale that would crop content
-
-5. OVERRIDES (for layers needing special treatment):
-   Each override needs: layerId, xOffset, yOffset, individualScale, layoutRole
-   If applying a rule: add citedRule with the rule text
-
-═══════════════════════════════════════════════════════════════════════════════
-CONFIDENCE TRIANGULATION
-═══════════════════════════════════════════════════════════════════════════════
-Before finalizing, verify your decisions against THREE evidence sources:
-1. VISUAL: What do you actually see in the image?
-2. KNOWLEDGE: What do the design rules say?
-3. METADATA: What do the layer names suggest?
-
-Confidence levels:
-- HIGH (3/3 sources agree)
-- MEDIUM (2/3 sources agree)
-- LOW (0-1 sources agree - use geometric fallback)
+TRIANGULATION: Verify against visual (image), knowledge (rules), metadata (layer names).
+HIGH=3/3 agree, MEDIUM=2/3, LOW=0-1 (use geometric fallback).
 ${constraintVerification}
-OUTPUT REQUIREMENTS:
-- visualAnalysis: Describe what you see (be specific, not generic)
-- rulesApplied: Array of {rule, application} for each design rule
-- method: "GEOMETRIC" (default) or "GENERATIVE" if rules say so
-- generativePrompt: "" unless method is GENERATIVE
-- suggestedScale: Scale factor so all content fits in target
-- overrides: Array of layer adjustments with xOffset, yOffset, individualScale
-- reasoning: Explain your layout decisions
-
-Think step by step:
-1. What content is in this container?
-2. How should elements be arranged in the new ${targetW}x${targetH} space?
-3. What scale keeps ALL content visible?
-4. Verify nothing is cropped`;
+OUTPUT: method, spatialLayout, suggestedScale, overrides (ALL layers), rulesApplied. Keep visualAnalysis and reasoning BRIEF (1-2 sentences max).
+IMPORTANT: Output the "overrides" array EARLY in your JSON — it is the CRITICAL output. Do not write long text before overrides.
+Think: 1) What's here? 2) How to arrange in ${targetW}x${targetH}? 3) What scale fits all? 4) Nothing cropped?`;
 
     return prompt;
   };
@@ -1674,9 +1454,10 @@ Think step by step:
                     required: ['allowedBleed', 'violationCount']
                 }
             },
-            required: ['visualAnalysis', 'rulesApplied', 'reasoning', 'method', 'spatialLayout', 'suggestedScale', 'anchor',
-                       'generativePrompt', 'semanticAnchors', 'clearance', 'overrides',
-                       'safetyReport', 'knowledgeApplied', 'directives', 'replaceLayerId']
+            // Only require critical fields — verbose text fields are optional to prevent token exhaustion
+            // before the model can output the overrides array (the most important data)
+            required: ['method', 'spatialLayout', 'suggestedScale', 'anchor', 'overrides',
+                       'rulesApplied', 'clearance', 'knowledgeApplied']
         };
 
         // Log Stage 2 user messages (text parts only, images omitted for readability)
@@ -1691,7 +1472,7 @@ Think step by step:
             systemPrompt: systemInstruction,
             messages,
             responseSchema,
-            maxTokens: 4096,
+            maxTokens: 8192,
             temperature: 0.7
         });
 
@@ -1724,12 +1505,12 @@ Think step by step:
 
         // --- PER-LAYER OVERRIDE VALIDATION ---
         // Ensure every layer has an override (generate defaults for missing layers)
-        const flattenLayerIds = (layers: SerializableLayer[], depth = 0, maxDepth = MAX_LAYER_DEPTH): { id: string; name: string; coords: any; }[] => {
+        const flattenLayerIds = (layers: SerializableLayer[], depth = 0, maxDepth = MAX_LAYER_DEPTH): { id: string; name: string; coords: any; isVisible: boolean; }[] => {
             if (depth > maxDepth) return [];
-            let result: { id: string; name: string; coords: any; }[] = [];
+            let result: { id: string; name: string; coords: any; isVisible: boolean; }[] = [];
             for (const layer of layers) {
                 if (layer.type === 'layer' || depth <= 1) {
-                    result.push({ id: layer.id, name: layer.name, coords: layer.coords });
+                    result.push({ id: layer.id, name: layer.name, coords: layer.coords, isVisible: layer.isVisible !== false });
                 }
                 if (layer.children && depth < maxDepth) {
                     result = result.concat(flattenLayerIds(layer.children, depth + 1, maxDepth));
@@ -1752,12 +1533,39 @@ Think step by step:
             const tgtH = targetData.bounds.h;
             const proportionalScale = Math.min(tgtW / sourceW, tgtH / sourceH);
 
+            // Detect geometry shift direction for smart redistribution
+            const srcRatio = sourceW / sourceH;
+            const tgtRatio = tgtW / tgtH;
+            const isGeometryShift = Math.abs(srcRatio - tgtRatio) > ASPECT_RATIO_TOLERANCE;
+            const isPortraitToLandscape = isGeometryShift && sourceH > sourceW && tgtW > tgtH;
+            const isLandscapeToPortrait = isGeometryShift && sourceW > sourceH && tgtH > tgtW;
+
+            // Collect VISIBLE flow layers for redistribution when geometry shifts
+            // Invisible layers (e.g. !FONT) must not participate in gap calculations
+            const flowLayers = missingLayers.filter(l => {
+                if (!l.isVisible) return false;
+                const role = inferLayoutRoleFromName(l.name);
+                return role === 'flow' || role === 'overlay';
+            });
+
             for (const layer of missingLayers) {
                 const role = inferLayoutRoleFromName(layer.name);
                 const relX = (layer.coords.x - sourceX) / sourceW;
                 const relY = (layer.coords.y - sourceY) / sourceH;
 
                 let override: LayerOverride;
+                // Invisible layers get simple proportional placement — don't participate in redistribution
+                if (!layer.isVisible) {
+                    override = {
+                        layerId: layer.id,
+                        layoutRole: role,
+                        xOffset: relX * tgtW,
+                        yOffset: relY * tgtH,
+                        individualScale: proportionalScale,
+                    };
+                    json.overrides.push(override);
+                    continue;
+                }
                 if (role === 'background') {
                     // Stretch to fill
                     override = {
@@ -1776,14 +1584,76 @@ Think step by step:
                         layoutRole: 'static',
                         xOffset: relX * tgtW,
                         yOffset: relY * tgtH,
-                        individualScale: 1, // Keep readable
+                        individualScale: 1,
                         edgeAnchor: {
                             horizontal: relX < 0.33 ? 'left' : (relX > 0.66 ? 'right' : 'center'),
                             vertical: relY < 0.33 ? 'top' : (relY > 0.66 ? 'bottom' : 'center'),
                         },
                     };
+                } else if ((isPortraitToLandscape || isLandscapeToPortrait) && flowLayers.length > 1) {
+                    // Geometry-shift-aware redistribution for flow/overlay layers
+                    const flowIndex = flowLayers.indexOf(layer);
+                    if (flowIndex === -1) {
+                        // Shouldn't happen, fallback to proportional
+                        override = {
+                            layerId: layer.id,
+                            layoutRole: role,
+                            xOffset: relX * tgtW,
+                            yOffset: relY * tgtH,
+                            individualScale: proportionalScale,
+                        };
+                    } else if (isPortraitToLandscape) {
+                        // Portrait→Landscape: distribute flow layers horizontally
+                        const heightScale = tgtH / sourceH;
+                        let fitScale = Math.min(heightScale, proportionalScale * 1.2); // Allow slightly larger than proportional
+                        let totalFlowWidth = flowLayers.reduce((sum, l) => sum + l.coords.w * fitScale, 0);
+                        const availableWidth = tgtW;
+                        // If content exceeds available space, shrink to fit with margin for gaps
+                        if (totalFlowWidth > availableWidth * 0.9) {
+                            fitScale = fitScale * (availableWidth * 0.85) / totalFlowWidth;
+                            totalFlowWidth = flowLayers.reduce((sum, l) => sum + l.coords.w * fitScale, 0);
+                        }
+                        const gapTotal = availableWidth - totalFlowWidth;
+                        const gap = Math.max(0, gapTotal / (flowLayers.length + 1));
+                        // Calculate cumulative x position
+                        let cumulativeX = gap;
+                        for (let i = 0; i < flowIndex; i++) {
+                            cumulativeX += flowLayers[i].coords.w * fitScale + gap;
+                        }
+                        override = {
+                            layerId: layer.id,
+                            layoutRole: role,
+                            xOffset: Math.max(0, cumulativeX),
+                            yOffset: (tgtH - layer.coords.h * fitScale) / 2, // vertically center
+                            individualScale: fitScale,
+                        };
+                    } else {
+                        // Landscape→Portrait: distribute flow layers vertically
+                        const widthScale = tgtW / sourceW;
+                        let fitScale = Math.min(widthScale, proportionalScale * 1.2);
+                        let totalFlowHeight = flowLayers.reduce((sum, l) => sum + l.coords.h * fitScale, 0);
+                        const availableHeight = tgtH;
+                        // If content exceeds available space, shrink to fit with margin for gaps
+                        if (totalFlowHeight > availableHeight * 0.9) {
+                            fitScale = fitScale * (availableHeight * 0.85) / totalFlowHeight;
+                            totalFlowHeight = flowLayers.reduce((sum, l) => sum + l.coords.h * fitScale, 0);
+                        }
+                        const gapTotal = availableHeight - totalFlowHeight;
+                        const gap = Math.max(0, gapTotal / (flowLayers.length + 1));
+                        let cumulativeY = gap;
+                        for (let i = 0; i < flowIndex; i++) {
+                            cumulativeY += flowLayers[i].coords.h * fitScale + gap;
+                        }
+                        override = {
+                            layerId: layer.id,
+                            layoutRole: role,
+                            xOffset: (tgtW - layer.coords.w * fitScale) / 2, // horizontally center
+                            yOffset: Math.max(0, cumulativeY),
+                            individualScale: fitScale,
+                        };
+                    }
                 } else {
-                    // Flow - proportional scaling and positioning
+                    // Flow - proportional scaling and positioning (no geometry shift)
                     override = {
                         layerId: layer.id,
                         layoutRole: role,
@@ -1794,7 +1664,7 @@ Think step by step:
                 }
                 json.overrides.push(override);
             }
-            console.log(`[Analyst] Total overrides after defaults: ${json.overrides.length}`);
+            console.log(`[Analyst] Total overrides after defaults: ${json.overrides.length}${isGeometryShift ? ` (geometry-shift redistribution: ${isPortraitToLandscape ? 'P→L horizontal' : isLandscapeToPortrait ? 'L→P vertical' : 'none'})` : ''}`);
         }
 
         // --- GEOMETRY FLAG INJECTION ---
@@ -1841,7 +1711,8 @@ Think step by step:
               json as LayoutStrategy,
               base64Clean,
               targetData.bounds.w,
-              targetData.bounds.h
+              targetData.bounds.h,
+              allLayers
             );
 
             console.log('[Analyst] Verification result:', {
@@ -1854,13 +1725,48 @@ Think step by step:
             });
 
             // Apply corrections if verification failed and corrections are provided
+            // MERGE corrections over existing overrides instead of full replacement
             if (!verification.passed && verification.correctedOverrides && verification.correctedOverrides.length > 0) {
-              console.log('[Analyst] Applying verification corrections:', verification.correctedOverrides.length, 'override corrections');
+              console.log('[Analyst] Merging verification corrections:', verification.correctedOverrides.length, 'override corrections over', json.overrides.length, 'existing');
+              const correctionMap = new Map<string, LayerOverride>();
+              for (const corr of verification.correctedOverrides) {
+                correctionMap.set(corr.layerId, corr);
+              }
+              // Merge: Stage 3 corrections override Stage 2 values per-layer, uncorrected layers keep Stage 2 values
+              const mergedOverrides = json.overrides.map((existing: LayerOverride) => {
+                const correction = correctionMap.get(existing.layerId);
+                if (correction) {
+                  return { ...existing, ...correction }; // correction fields overwrite existing
+                }
+                return existing;
+              });
+              // Add any corrections for layers not in Stage 2 (shouldn't normally happen)
+              for (const [layerId, corr] of correctionMap) {
+                if (!json.overrides.some((o: LayerOverride) => o.layerId === layerId)) {
+                  mergedOverrides.push(corr);
+                }
+              }
+              // Clamp all coordinates to target bounds — reject off-screen positions
+              const tW = targetData.bounds.w;
+              const tH = targetData.bounds.h;
+              let clampedCount = 0;
+              for (const ov of mergedOverrides) {
+                if (ov.layoutRole === 'background') continue; // backgrounds always at 0,0
+                const origX = ov.xOffset;
+                const origY = ov.yOffset;
+                ov.xOffset = Math.max(0, Math.min(ov.xOffset, tW));
+                ov.yOffset = Math.max(0, Math.min(ov.yOffset, tH));
+                if (origX !== ov.xOffset || origY !== ov.yOffset) clampedCount++;
+              }
+              if (clampedCount > 0) {
+                console.log(`[Analyst] Clamped ${clampedCount} overrides to target bounds ${tW}x${tH}`);
+              }
+
               finalStrategy = {
                 ...json,
-                overrides: verification.correctedOverrides,
+                overrides: mergedOverrides,
                 suggestedScale: verification.correctedScale ?? json.suggestedScale,
-                reasoning: json.reasoning + '\n\n[STAGE 3 VERIFICATION CORRECTIONS APPLIED]\n' +
+                reasoning: json.reasoning + '\n\n[STAGE 3 VERIFICATION CORRECTIONS MERGED]\n' +
                   verification.issues.map(i => `- ${i.type}: ${i.description}`).join('\n')
               };
             } else if (!verification.passed) {

@@ -176,6 +176,106 @@ async function processContentForOllama(content: ContentPart[]): Promise<ContentP
 }
 
 /**
+ * Attempt to repair truncated JSON by closing open structures.
+ * Handles the common case where the model runs out of output tokens mid-JSON.
+ */
+function repairTruncatedJson(text: string): any | null {
+  // Find the first { to start from
+  const start = text.indexOf('{');
+  if (start === -1) return null;
+
+  let jsonText = text.slice(start);
+
+  // Track open structures
+  let inString = false;
+  let escaped = false;
+  const stack: string[] = [];
+
+  for (let i = 0; i < jsonText.length; i++) {
+    const ch = jsonText[i];
+
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+
+    if (ch === '\\' && inString) {
+      escaped = true;
+      continue;
+    }
+
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
+
+    if (inString) continue;
+
+    if (ch === '{') stack.push('}');
+    else if (ch === '[') stack.push(']');
+    else if (ch === '}' || ch === ']') {
+      if (stack.length > 0 && stack[stack.length - 1] === ch) {
+        stack.pop();
+      }
+    }
+  }
+
+  // If nothing is open, no repair needed (or the text is balanced already)
+  if (stack.length === 0) return null;
+
+  // If we're inside a string, close it first
+  if (inString) {
+    jsonText += '"';
+  }
+
+  // Trim trailing incomplete tokens (partial key-value pairs)
+  // Remove trailing comma, colon, or incomplete value
+  jsonText = jsonText.replace(/,\s*$/, '');
+  jsonText = jsonText.replace(/:\s*$/, ': null');
+  jsonText = jsonText.replace(/,\s*"[^"]*$/, ''); // remove trailing partial key
+
+  // Close all open structures in reverse order
+  while (stack.length > 0) {
+    jsonText += stack.pop();
+  }
+
+  try {
+    return JSON.parse(jsonText);
+  } catch {
+    // One more attempt: try to fix common issues
+    // Remove trailing partial array elements
+    jsonText = text.slice(start);
+    if (inString) jsonText += '"';
+    // Find the last complete value (ends with }, ], ", number, true, false, null)
+    const lastGood = jsonText.search(/[}\]"0-9](?=[^}\]"0-9]*$)/);
+    if (lastGood > 0) {
+      jsonText = jsonText.slice(0, lastGood + 1);
+      // Recount and close
+      const stack2: string[] = [];
+      let inStr2 = false;
+      let esc2 = false;
+      for (let i = 0; i < jsonText.length; i++) {
+        const ch = jsonText[i];
+        if (esc2) { esc2 = false; continue; }
+        if (ch === '\\' && inStr2) { esc2 = true; continue; }
+        if (ch === '"') { inStr2 = !inStr2; continue; }
+        if (inStr2) continue;
+        if (ch === '{') stack2.push('}');
+        else if (ch === '[') stack2.push(']');
+        else if ((ch === '}' || ch === ']') && stack2.length > 0 && stack2[stack2.length - 1] === ch) stack2.pop();
+      }
+      while (stack2.length > 0) jsonText += stack2.pop();
+      try {
+        return JSON.parse(jsonText);
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
+}
+
+/**
  * Generate completion using Qwen2.5-VL via Ollama (OpenAI-compatible API)
  */
 async function generateWithQwenLocal(options: GenerateOptions): Promise<GenerateResult> {
@@ -293,7 +393,19 @@ async function generateWithQwenLocal(options: GenerateOptions): Promise<Generate
         try {
           json = JSON.parse(text.slice(jsonStart, jsonEnd + 1));
         } catch (e2) {
-          console.error('JSON extraction also failed');
+          console.warn('JSON extraction failed, attempting truncation repair...');
+          // Attempt to repair truncated JSON (model ran out of output tokens)
+          const repaired = repairTruncatedJson(text);
+          if (repaired) {
+            console.log('JSON repair succeeded — output was likely truncated by maxTokens');
+            console.log('Recovered keys:', Object.keys(repaired));
+            if (repaired.overrides) {
+              console.log('Recovered', repaired.overrides.length, 'overrides from truncated response');
+            }
+            json = repaired;
+          } else {
+            console.error('JSON repair also failed. Raw text length:', text.length);
+          }
         }
       }
     }
