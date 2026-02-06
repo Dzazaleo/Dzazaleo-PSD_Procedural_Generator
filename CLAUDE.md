@@ -53,16 +53,18 @@ LoadPSD → DesignInfo/TemplateSplitter → ContainerResolver → DesignAnalyst 
 
 **AI Provider Service** ([services/aiProviderService.ts](services/aiProviderService.ts)) - Qwen/Ollama AI abstraction:
 - `generateCompletion()`: Unified interface for text/vision inference with structured JSON output
-- Uses Ollama with local vision-language models (default: `qwen3-vl:8b`, fallback: `qwen2.5vl:7b`)
-- **Requires Ollama 0.12.7+** (tested on 0.12.11)
+- Uses Ollama with local vision-language models (default: `qwen3-vl:8b-instruct`, fallback: `qwen2.5vl:7b`)
+- **Requires Ollama 0.12.7+** (tested on 0.15.5)
+- **Instruct variant required:** The thinking variant (`qwen3-vl:8b`) wastes tokens on `<think>` blocks, often exhausting `max_tokens` before producing content. The `-instruct` variant has the same base model and vision capabilities but no thinking overhead.
+- **No `response_format`:** Ollama 0.13+ has bugs with `response_format: {type: 'json_object'}` + thinking models (GitHub #10929, #10976). JSON output is guided by schema hints appended to the system prompt instead.
 - Automatic image downscaling for local models (max 1024px, aligned to 32px patch size for Qwen3-VL)
 - Supports up to 8 images per request (`MAX_IMAGES_PER_REQUEST=8`)
-- Large context window (`num_ctx: 32768`) — needed because Qwen3's thinking tokens consume the `max_tokens` (= `num_predict`) budget on Ollama
-- Qwen3 thinking mode handled automatically: JSON mode separates thinking into `reasoning` field; `<think>` tag stripping as safety net
-- **Token budget for thinking:** Qwen3's thinking tokens consume the `max_tokens` budget on Ollama, so all stage `maxTokens` values account for 2-8K thinking overhead (see DesignAnalystNode section for per-stage values)
+- Large context window (`num_ctx: 32768`) — ensures input + output fit within context window
+- `<think>` tag stripping as safety net (closed tags, unclosed tags, preamble text before JSON)
+- Empty response detection with diagnostic logging and reasoning-field JSON fallback
 - JSON response parsing with markdown code fence stripping and truncation repair
 - Health checks for local servers via `checkQwenServerHealth()`
-- Debug logging for Qwen requests (model, image count, text length)
+- Debug logging for Qwen requests (model, image count, text length, response structure)
 
 ### Node Connection Validation
 
@@ -89,14 +91,14 @@ PSD files use a `!!TEMPLATE` top-level group containing container definitions. C
 ### AI Integration
 
 **AI Provider Service** ([services/aiProviderService.ts](services/aiProviderService.ts)) - Qwen/Ollama AI backend:
-- `qwen-local`: Ollama with local vision-language models (default: `qwen3-vl:8b`)
+- `qwen-local`: Ollama with local vision-language models (default: `qwen3-vl:8b-instruct`)
 
 #### Environment Configuration (`.env.local`)
 
 ```bash
 # Qwen Local (Ollama) configuration
 VITE_QWEN_BASE_URL=http://localhost:11434/v1
-VITE_QWEN_MODEL=qwen3-vl:8b  # Best quality/VRAM ratio for 24GB GPU
+VITE_QWEN_MODEL=qwen3-vl:8b-instruct  # Instruct variant — no thinking overhead, reliable JSON
 
 # ComfyUI (optional, for draft generation - currently disabled)
 VITE_COMFYUI_URL=http://127.0.0.1:8188
@@ -104,20 +106,21 @@ VITE_COMFYUI_URL=http://127.0.0.1:8188
 
 #### Ollama Setup
 
-**Requires Ollama 0.12.7+** (tested on 0.12.11). Qwen3-VL architecture support was added in 0.12.7.
+**Requires Ollama 0.12.7+** (tested on 0.15.5). Qwen3-VL architecture support was added in 0.12.7.
 
 1. Install Ollama: https://ollama.com/download/windows
 2. Verify version: `ollama --version` (should show 0.12.7 or later)
-3. Pull the vision model: `ollama pull qwen3-vl:8b` (~6.1GB download, ~8GB VRAM during inference)
+3. Pull the vision model: `ollama pull qwen3-vl:8b-instruct` (~6.1GB download, ~8GB VRAM during inference)
 
 **Model Options** (configured via `VITE_QWEN_MODEL` in `.env.local`):
-- `qwen3-vl:8b`: **Recommended** — Newest architecture, best quality/VRAM ratio (~6.1GB weights, ~18GB headroom on 24GB GPU)
+- `qwen3-vl:8b-instruct`: **Recommended** — Instruct variant (no thinking tokens), reliable JSON output (~6.1GB weights, ~18GB headroom on 24GB GPU)
+- `qwen3-vl:8b`: Thinking variant — **not recommended**, wastes tokens on `<think>` blocks that often exhaust `max_tokens` before producing content
 - `qwen2.5vl:7b`: Legacy fallback (~6GB weights)
 - `minicpm-v:8b`: Lightweight alternative (~5.5GB weights)
 
 **Note:** Model selection is configured via environment variable only. The UI displays the current model but does not provide a selector.
 
-**Qwen3-VL Thinking Mode:** Qwen3 models emit `<think>...</think>` reasoning by default. In JSON mode (used by all 3 pipeline stages), thinking goes to a separate `reasoning` field and `content` contains clean JSON. The code also strips `<think>` tags as a safety net.
+**Why instruct variant:** The thinking variant (`qwen3-vl:8b`) emits `<think>...</think>` reasoning that consumes the `max_tokens` budget on Ollama. Thinking cannot be disabled via API (`think: false` not merged, `/no_think` removed). The `-instruct` variant has the same base model and vision capabilities without thinking overhead.
 
 #### AI Features
 
@@ -203,18 +206,20 @@ Layout strategies include confidence triangulation (`TriangulationAudit`) with v
 - Confidence triangulation via visual, knowledge, and metadata vectors
 - Knowledge integration: scopes rules per container, respects mute toggle
 - Draft generation disabled (requires ComfyUI integration)
-- **Token budget (accounts for Qwen3 thinking overhead):**
-  - Ollama maps `max_tokens` → `num_predict`, which caps ALL output tokens (thinking + JSON content)
-  - Qwen3-VL uses 2000-8000 thinking tokens before producing JSON, depending on prompt complexity
-  - Stage 1 `maxTokens: 8192` — 14-field JSON schema with moderate thinking overhead
-  - Stage 2 `maxTokens: 16384` — complex layout reasoning, heavy thinking
-  - Stage 3 `maxTokens: 8192` — verification, moderate-to-heavy thinking
+- **Token budget:**
+  - Ollama maps `max_tokens` → `num_predict`, which caps ALL output tokens
+  - With instruct variant, full budget goes to JSON content (no thinking overhead)
+  - Stage 1 `maxTokens: 8192` — 14-field SourceAnalysis JSON schema
+  - Stage 2 `maxTokens: 16384` — complex layout with per-item overrides
+  - Stage 3 `maxTokens: 8192` — verification (skipped if AI produced 0 overrides in Stage 2)
   - `num_ctx: 32768` in `aiProviderService.ts` ensures input + output fit within context window
   - If JSON responses are still truncated, increase `maxTokens` in the relevant `generateCompletion()` call
-- **Token optimization for local models:**
-  - Depth-limited layer flattening (`MAX_LAYER_DEPTH=3`) prevents token explosion on nested containers
+- **Token optimization for local 8B models:**
+  - **Group-level flattening:** Stage 2 only sends top-level layers/groups to the AI (typically 5-15 items vs 20-50+ individual layers). Groups are positioned as units.
+  - **Group override propagation:** When AI positions a group, child overrides are auto-generated — children inherit the group's transform with source-space delta offsets preserved.
   - Layer sample capped at `MAX_LAYERS_IN_PROMPT=20` for comprehensive container coverage
-  - Stage 2 schema uses minimal required fields to prevent JSON truncation on local models
+  - **Minimal Stage 2 JSON schema:** Only 4 required fields (`overrides`, `method`, `spatialLayout`, `suggestedScale`). Verbose metadata fields (14 fields including `visualAnalysis`, `triangulation`, `rulesApplied`, etc.) removed to prevent the 8B model from filling text fields and truncating before reaching overrides.
+  - `overrides` array listed first in schema so models emit it before running out of tokens
 - **Persistence optimization:** `sourceReference` (base64 image) stripped from stored state to prevent project file bloat
 - **Configuration constants** (defined at module scope):
   - `ASPECT_RATIO_TOLERANCE=0.15`: Threshold for detecting geometry shift between source/target
@@ -229,12 +234,12 @@ Layout strategies include confidence triangulation (`TriangulationAudit`) with v
   - `background`: Stretches to fill target container (independent X/Y scaling via `scaleX`/`scaleY`)
   - `flow`: Proportional positioning - maintains relative position within container, uniform scale
   - `static`: Edge pinning via `edgeAnchor` - UI elements maintain proportional distance from their pinned edges (left/center/right × top/center/bottom)
-  - `overlay`: Positioned relative to parent layer (uses `linkedAnchorId`), adjusted in physics pass
+  - `overlay`: Positioned relative to parent layer (uses `linkedAnchorId`), delta scaled by anchor's actual transform (not base scale)
 - Base spatial layout engines provide fallback when no per-layer overrides exist:
   - `UNIFIED_FIT`: Aspect-preserving scale + center (default)
   - `STRETCH_FILL`: Force-fit to container
   - `ABSOLUTE_PIN`: Explicit positioning via overrides
-- Physics solvers for semantic mode: grid distribution, collision prevention, overlay snapping, boundary clamping
+- Physics solvers for semantic mode: grid distribution, collision prevention, overlay snapping, boundary clamping (operates on flattened layer tree)
 - Integrates feedback from DesignReviewer for iterative refinement
 - AI preview generation with aspect ratio normalization
 - Produces `TransformedPayload` with positioned layers and metadata
@@ -319,12 +324,13 @@ Image dimensions must be aligned to the model's patch size. Qwen3-VL requires di
 $env:OLLAMA_DEBUG="1"; ollama serve
 ```
 
-**Qwen3 thinking mode issues:**
-- All 3 pipeline stages use JSON mode (`response_format: {type: "json_object"}`), which correctly separates thinking into a `reasoning` field
-- The `content` field contains clean JSON output
-- `<think>` tag stripping in `aiProviderService.ts` acts as a safety net
-- `think: false` API parameter does NOT work on Ollama 0.12.11 — not relied upon
-- **CRITICAL: Thinking tokens consume `max_tokens` budget.** Ollama maps `max_tokens` to `num_predict`, which limits ALL generated tokens (thinking + content). Complex prompts need 2-4x the naive token estimate. If JSON responses are truncated, increase `maxTokens` in the `generateCompletion()` calls and ensure `num_ctx` >= input_tokens + max_tokens.
+**Qwen3 thinking mode / empty responses:**
+- **Use the `-instruct` variant** (`qwen3-vl:8b-instruct`). The thinking variant exhausts `max_tokens` on reasoning, leaving `content` empty.
+- `response_format: {type: "json_object"}` is **not used** — Ollama 0.13+ bugs cause empty content with thinking models. Schema hints in the system prompt guide JSON output instead.
+- `<think>` tag stripping in `aiProviderService.ts` handles: closed tags, unclosed tags (model truncated during thinking), and preamble text before JSON.
+- Empty response detection logs diagnostics and attempts to extract JSON from the `reasoning` field as fallback.
+- `think: false` API parameter does NOT work on Ollama — not relied upon.
+- If JSON responses are truncated, increase `maxTokens` in the `generateCompletion()` calls and ensure `num_ctx` >= input_tokens + max_tokens.
 
 **Analysis failures:**
 - DesignAnalystNode displays error messages directly in the UI (red banner below chat)
