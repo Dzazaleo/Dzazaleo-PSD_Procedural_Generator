@@ -510,7 +510,7 @@ const InstanceRow: React.FC<InstanceRowProps> = ({
                                             </div>
                                         </div>
 
-                                        <StrategyCard strategy={msg.strategySnapshot} modelConfig={activeModelConfig} />
+                                        <StrategyCard strategy={msg.strategySnapshot} />
                                     </div>
                                 )}
                             </div>
@@ -1003,7 +1003,7 @@ Focus on UNDERSTANDING, not layout decisions.`;
         ]
       }],
       responseSchema: sourceAnalysisSchema,
-      maxTokens: 4096,  // Qwen3 thinking tokens consume max_tokens budget; 4K gives headroom
+      maxTokens: 8192,  // Qwen3 thinking tokens (2-4K) + 14-field JSON schema needs 8K total
       temperature: 0.3
     });
 
@@ -1130,7 +1130,7 @@ Output JSON: { "passed": bool, "issues": [...], "correctedOverrides": [...] (if 
         ]
       }],
       responseSchema: verificationSchema,
-      maxTokens: 4096,  // Qwen3 thinking tokens consume max_tokens budget; 4K gives headroom
+      maxTokens: 8192,  // Qwen3 thinking tokens consume max_tokens budget; 8K for verification
       temperature: 0.2
     });
 
@@ -1162,48 +1162,54 @@ Output JSON: { "passed": bool, "issues": [...], "correctedOverrides": [...] (if 
     const targetW = targetData.bounds.w;
     const targetH = targetData.bounds.h;
 
-    // Depth-limited flattening to prevent token explosion on nested containers
-    // maxDepth=3 allows deeper nesting while avoiding explosion (24GB VRAM has headroom)
-    const flattenLayers = (layers: SerializableLayer[], depth = 0, maxDepth = MAX_LAYER_DEPTH): any[] => {
-        if (depth > maxDepth) return [];
-
-        let flat: any[] = [];
-        layers.forEach(l => {
-            // Only include actual content layers + top-level groups (skip deep nested groups)
-            if (l.type === 'layer' || depth <= 1) {
-                let effectiveCoords = l.coords;
-
-                if (l.type === 'group' && l.children && l.children.length > 0) {
-                    const tightBounds = calculateGroupBounds(l.children);
-                    if (tightBounds.w > 0 && tightBounds.h > 0) {
-                         effectiveCoords = tightBounds;
-                    }
-                }
-
-                flat.push({
-                    id: l.id,
-                    name: l.name,
-                    type: l.type,
-                    depth: depth,
-                    relX: (effectiveCoords.x - sourceData.container.bounds.x) / sourceW,
-                    relY: (effectiveCoords.y - sourceData.container.bounds.y) / sourceH,
-                    absX: effectiveCoords.x,
-                    absY: effectiveCoords.y,
-                    width: effectiveCoords.w,
-                    height: effectiveCoords.h,
-                    childCount: l.children?.length ?? 0,
-                    isVisible: l.isVisible !== false
-                });
-            }
-
+    // Hierarchical flattening: only top-level layers and groups (not individual children).
+    // Groups are positioned as units — after AI responds, group overrides propagate to all descendants.
+    // This produces a compact list the 8B model can handle (typically 5-15 items vs 20-50+).
+    const countDescendantLayers = (layers: SerializableLayer[], depth = 0, maxDepth = MAX_LAYER_DEPTH): { total: number; visible: number } => {
+        if (depth > maxDepth) return { total: 0, visible: 0 };
+        let total = 0, visible = 0;
+        for (const l of layers) {
+            total++;
+            if (l.isVisible !== false) visible++;
             if (l.children && depth < maxDepth) {
-                flat = flat.concat(flattenLayers(l.children, depth + 1, maxDepth));
+                const sub = countDescendantLayers(l.children, depth + 1, maxDepth);
+                total += sub.total;
+                visible += sub.visible;
             }
-        });
-        return flat;
+        }
+        return { total, visible };
     };
 
-    const layerAnalysisData = flattenLayers(sourceData.layers as SerializableLayer[]);
+    const layerAnalysisData: any[] = [];
+    for (const l of (sourceData.layers as SerializableLayer[])) {
+        let effectiveCoords = l.coords;
+        let groupMeta = '';
+
+        if (l.type === 'group' && l.children && l.children.length > 0) {
+            const tightBounds = calculateGroupBounds(l.children);
+            if (tightBounds.w > 0 && tightBounds.h > 0) {
+                effectiveCoords = tightBounds;
+            }
+            const counts = countDescendantLayers(l.children, 1);
+            groupMeta = ` (${counts.total} layers: ${counts.visible}vis, ${counts.total - counts.visible}hid)`;
+        }
+
+        layerAnalysisData.push({
+            id: l.id,
+            name: l.name,
+            type: l.type,
+            depth: 0,
+            relX: (effectiveCoords.x - sourceData.container.bounds.x) / sourceW,
+            relY: (effectiveCoords.y - sourceData.container.bounds.y) / sourceH,
+            absX: effectiveCoords.x,
+            absY: effectiveCoords.y,
+            width: effectiveCoords.w,
+            height: effectiveCoords.h,
+            childCount: l.children?.length ?? 0,
+            isVisible: l.isVisible !== false,
+            groupMeta,
+        });
+    }
 
     // Compute spatial proximity: for each layer, find the closest larger layer it overlaps with
     // This helps the AI detect companion elements (labels on objects, values near counters)
@@ -1306,12 +1312,13 @@ VISUAL ANCHORS: ${effectiveKnowledge.visualAnchors.length} reference image(s) fo
     const layerRows = layerAnalysisData.slice(0, MAX_LAYERS_IN_PROMPT).map(l => {
       const vis = l.isVisible ? '' : ' [HIDDEN]';
       const near = proximityMap.has(l.id) ? ` near:${proximityMap.get(l.id)}` : '';
-      return `${l.id} | ${l.name}${vis} | ${l.relX.toFixed(2)},${l.relY.toFixed(2)} | ${l.width}x${l.height} | ${l.type}${l.childCount > 0 ? ` (${l.childCount}ch)` : ''}${near}`;
+      const typeInfo = l.groupMeta ? `group${l.groupMeta}` : l.type;
+      return `${l.id} | ${l.name}${vis} | ${l.relX.toFixed(2)},${l.relY.toFixed(2)} | ${l.width}x${l.height} | ${typeInfo}${near}`;
     }).join('\n');
     const layerDataSection = `
-LAYERS (${layerAnalysisData.length} total, showing ${Math.min(MAX_LAYERS_IN_PROMPT, layerAnalysisData.length)}):
-CRITICAL: Use ONLY the first column (ID) as "layerId" in overrides. Do NOT use the Name column.
-[HIDDEN] = invisible layer (skip or minimal override). "near:ID" = spatially overlaps that layer.
+LAYOUT ITEMS (${layerAnalysisData.length} items — provide ONE override per item):
+Use ONLY the first column (ID) as "layerId" in overrides. Do NOT use the Name column.
+Groups contain child layers — position the GROUP and all children inherit the transform automatically.
 ID | Name | RelX,RelY | WxH | Type
 ${layerRows}
 `;
@@ -1319,28 +1326,29 @@ ${layerRows}
     // Per-Layer Strategy Section (compact)
     const proportionalScale = Math.min(targetW/sourceW, targetH/sourceH);
     const perLayerSection = `
-PER-LAYER OVERRIDES (one override per layer, NO EXCEPTIONS):
+PER-ITEM OVERRIDES (one override per item):
 
-Role behaviors:
-- "background": stretch to fill. scaleX=${(targetW/sourceW).toFixed(3)}, scaleY=${(targetH/sourceH).toFixed(3)}, xOffset=0, yOffset=0
-- "flow": independent element with proportional positioning. scale=${proportionalScale.toFixed(3)}, position = relativePos × targetDims
-- "static": edge-pinned UI. scale~1.0, use edgeAnchor {horizontal,vertical}
-- "overlay": COMPANION element that MOVES WITH its parent. Set linkedAnchorId to the parent layer's ID.
-  The overlay will be repositioned relative to its anchor automatically — just set same xOffset/yOffset as anchor.
-  USE THIS for: labels on objects, values near counters, badges on items, captions with images.
-  If a layer has "near:ID" in the layer table, it likely overlaps that layer and may be its companion.
+COORDINATE SYSTEM: xOffset and yOffset are ABSOLUTE PIXEL positions from target top-left (0,0).
+- xOffset ranges from 0 to ${targetW}
+- yOffset ranges from 0 to ${targetH}
+To convert from table: xOffset = RelX × ${targetW}, yOffset = RelY × ${targetH}
+Example: item at RelX=0.58, RelY=0.28 → xOffset=${Math.round(0.58 * targetW)}, yOffset=${Math.round(0.28 * targetH)}
 
-SEMANTIC GROUPING RULE (CRITICAL):
-When elements are visually paired (a label sits on/near an object), the SMALLER element must be "overlay" with
-linkedAnchorId pointing to the LARGER element. This ensures they move together during layout recomposition.
-Do NOT make both elements "flow" — they will be separated.
+Role behaviors (choose based on element function):
+- "background": Full-bleed fill. scaleX=${(targetW/sourceW).toFixed(3)}, scaleY=${(targetH/sourceH).toFixed(3)}, xOffset=0, yOffset=0
+- "flow": Main visual content (items, images, cards, groups). scale=${proportionalScale.toFixed(3)}.
+  xOffset = RelX × ${targetW}, yOffset = RelY × ${targetH}. These are the BIGGEST elements after background.
+- "static": Small UI pinned to edges (buttons, counters, close icons). scale~1.0, use edgeAnchor {horizontal,vertical}.
+  Still needs xOffset/yOffset in PIXELS (e.g., xOffset=${Math.round(targetW * 0.5)}, yOffset=${Math.round(targetH * 0.9)})
+- "overlay": COMPANION attached to a larger element. Set linkedAnchorId to parent's ID.
+  If "near:ID" in table → likely companion of that item.
 
 Source ${sourceW}x${sourceH} → Target ${targetW}x${targetH}
 Proportional scale: ${proportionalScale.toFixed(3)}
 
-Each override MUST have: layerId, layoutRole, xOffset, yOffset, individualScale.
-layerId MUST be the ID from the first column of the layer table (e.g. "1.0", "1.8"), NOT the layer name.
-Missing layers = INVALID OUTPUT.
+Each override MUST have: layerId, layoutRole, xOffset (PIXELS 0-${targetW}), yOffset (PIXELS 0-${targetH}), individualScale.
+layerId MUST be the ID from the first column (e.g. "6.0.0", "6.0.3"), NOT the layer name.
+Missing items = INVALID OUTPUT.
 `;
 
     // Constraint summary for the task header
@@ -1365,17 +1373,7 @@ SOURCE ANALYSIS (from Stage 1 - use this, don't re-analyze):
 ${semanticGroupsText}
 TASK: Adapt from ${sourceOrientation} (${sourceW}x${sourceH}) to ${targetOrientation} (${targetW}x${targetH})
 ${targetW > targetH ? 'Target is LANDSCAPE - spread elements horizontally.' : 'Target is PORTRAIT - stack elements vertically.'}
-
-Your visualAnalysis must mention: ${sourceAnalysis.primaryElements.slice(0, 3).join(', ')}
 ` : '';
-
-    // Constraint verification (compact)
-    const constraintVerification = `
-VERIFY BEFORE OUTPUT:
-- All content visible (no cropping)? Fits in ${targetW}x${targetH}?
-- Text centered? Visual balance? Geometry recomposed (not just scaled)?
-- All rules cited? If ANY fails, adjust before responding.
-`;
 
     const prompt = `${expertPersona}
 TASK: "${sourceData.container.containerName}" (${sourceW}x${sourceH}) → "${targetData.name}" (${targetW}x${targetH})
@@ -1387,19 +1385,9 @@ ${knowledgeSection}
 ${anchorSection}
 ${layerDataSection}
 ${perLayerSection}
-DECISIONS:
-1. spatialLayout: "UNIFIED_FIT" (scale+center) | "STRETCH_FILL" (fill container) | "ABSOLUTE_PIN" (exact positions)
-2. layoutMode: "STANDARD" | "GRID" | "DISTRIBUTE_HORIZONTAL" | "DISTRIBUTE_VERTICAL"
-3. Classify each layer role: flow/static/overlay/background
-4. suggestedScale: min scale so ALL content fits (account for padding rules)
-5. overrides: one per layer with layerId, xOffset, yOffset, individualScale, layoutRole
-
-TRIANGULATION: Verify against visual (image), knowledge (rules), metadata (layer names).
-HIGH=3/3 agree, MEDIUM=2/3, LOW=0-1 (use geometric fallback).
-${constraintVerification}
-OUTPUT: method, spatialLayout, suggestedScale, overrides (ALL layers), rulesApplied. Keep visualAnalysis and reasoning BRIEF (1-2 sentences max).
-IMPORTANT: Output the "overrides" array EARLY in your JSON — it is the CRITICAL output. Do not write long text before overrides.
-Think: 1) What's here? 2) How to arrange in ${targetW}x${targetH}? 3) What scale fits all? 4) Nothing cropped?`;
+OUTPUT: JSON with "overrides" array FIRST (one entry per item), then "method", "spatialLayout", "suggestedScale".
+"overrides" is the CRITICAL output — emit it FIRST. Every item MUST have an override.
+VERIFY: All content fits in ${targetW}x${targetH}? Nothing cropped or off-screen? Text centered? Visual balance?`;
 
     return prompt;
   };
@@ -1537,66 +1525,25 @@ Think: 1) What's here? 2) How to arrange in ${targetW}x${targetH}? 3) What scale
             });
         }
 
-        // Define JSON Schema for structured output
+        // Define JSON Schema — MINIMAL to prevent truncation on 8B models.
+        // "overrides" is listed FIRST so models emit it before running out of tokens.
+        // All verbose text fields (visualAnalysis, reasoning, triangulation, etc.) removed —
+        // the 8B model was filling 14 metadata fields and truncating before reaching overrides.
         const responseSchema: StructuredOutputSchema = {
             type: 'object',
             properties: {
-                visualAnalysis: { type: 'string' },
-                rulesApplied: {
-                    type: 'array',
-                    items: {
-                        type: 'object',
-                        properties: {
-                            rule: { type: 'string' },
-                            application: { type: 'string' }
-                        },
-                        required: ['rule', 'application']
-                    }
-                },
-                reasoning: { type: 'string' },
-                method: { type: 'string', enum: ['GEOMETRIC', 'GENERATIVE', 'HYBRID'] },
-                spatialLayout: { type: 'string', enum: ['STRETCH_FILL', 'UNIFIED_FIT', 'ABSOLUTE_PIN'] },
-                suggestedScale: { type: 'number' },
-                anchor: { type: 'string', enum: ['TOP', 'CENTER', 'BOTTOM', 'STRETCH'] },
-                generativePrompt: { type: 'string' },
-                semanticAnchors: { type: 'array', items: { type: 'string' } },
-                clearance: { type: 'boolean' },
-                knowledgeApplied: { type: 'boolean' },
-                directives: { type: 'array', items: { type: 'string' } },
-                replaceLayerId: { type: 'string' },
-                triangulation: {
-                    type: 'object',
-                    properties: {
-                        visual_identification: { type: 'string' },
-                        knowledge_correlation: { type: 'string' },
-                        metadata_validation: { type: 'string' },
-                        evidence_count: { type: 'number' },
-                        confidence_verdict: { type: 'string', enum: ['HIGH', 'MEDIUM', 'LOW'] }
-                    },
-                    required: ['visual_identification', 'knowledge_correlation', 'metadata_validation', 'evidence_count', 'confidence_verdict']
-                },
-                layoutMode: { type: 'string', enum: ['STANDARD', 'DISTRIBUTE_HORIZONTAL', 'DISTRIBUTE_VERTICAL', 'GRID'] },
-                physicsRules: {
-                    type: 'object',
-                    properties: {
-                        preventOverlap: { type: 'boolean' },
-                        preventClipping: { type: 'boolean' }
-                    }
-                },
                 overrides: {
                     type: 'array',
                     items: {
                         type: 'object',
                         properties: {
                             layerId: { type: 'string' },
+                            layoutRole: { type: 'string', enum: ['flow', 'static', 'overlay', 'background'] },
                             xOffset: { type: 'number' },
                             yOffset: { type: 'number' },
                             individualScale: { type: 'number' },
                             scaleX: { type: 'number' },
                             scaleY: { type: 'number' },
-                            citedRule: { type: 'string' },
-                            anchorIndex: { type: 'integer' },
-                            layoutRole: { type: 'string', enum: ['flow', 'static', 'overlay', 'background'] },
                             linkedAnchorId: { type: 'string' },
                             edgeAnchor: {
                                 type: 'object',
@@ -1609,19 +1556,11 @@ Think: 1) What's here? 2) How to arrange in ${targetW}x${targetH}? 3) What scale
                         required: ['layerId', 'layoutRole', 'xOffset', 'yOffset']
                     }
                 },
-                safetyReport: {
-                    type: 'object',
-                    properties: {
-                        allowedBleed: { type: 'boolean' },
-                        violationCount: { type: 'integer' }
-                    },
-                    required: ['allowedBleed', 'violationCount']
-                }
+                method: { type: 'string', enum: ['GEOMETRIC', 'GENERATIVE', 'HYBRID'] },
+                spatialLayout: { type: 'string', enum: ['STRETCH_FILL', 'UNIFIED_FIT', 'ABSOLUTE_PIN'] },
+                suggestedScale: { type: 'number' }
             },
-            // Only require critical fields — verbose text fields are optional to prevent token exhaustion
-            // before the model can output the overrides array (the most important data)
-            required: ['method', 'spatialLayout', 'suggestedScale', 'anchor', 'overrides',
-                       'rulesApplied', 'clearance', 'knowledgeApplied']
+            required: ['overrides', 'method', 'spatialLayout', 'suggestedScale']
         };
 
         // Log Stage 2 user messages (text parts only, images omitted for readability)
@@ -1655,7 +1594,7 @@ Think: 1) What's here? 2) How to arrange in ${targetW}x${targetH}? 3) What scale
             clearance: rawJson.clearance ?? false,
             knowledgeApplied: rawJson.knowledgeApplied ?? false,
             directives: rawJson.directives || [],
-            replaceLayerId: rawJson.replaceLayerId || '',
+            replaceLayerId: rawJson.replaceLayerId || null,
             triangulation: rawJson.triangulation || null,
             overrides: rawJson.overrides || [],
             safetyReport: rawJson.safetyReport || { allowedBleed: false, violationCount: 0 },
@@ -1753,6 +1692,115 @@ Think: 1) What's here? 2) How to arrange in ${targetW}x${targetH}? 3) What scale
             json.overrides = Array.from(idBasedMap.values());
             if (remapped > 0 || merged > 0 || discarded > 0) {
                 console.log(`[Analyst] Override reconciliation: ${remapped} remapped, ${merged} merged, ${discarded} discarded`);
+            }
+        }
+
+        // Track AI override count before propagation (used to skip Stage 3 if AI produced nothing)
+        const aiOverrideCount = (json.overrides as LayerOverride[]).length;
+
+        // --- GROUP OVERRIDE PROPAGATION ---
+        // When AI provides an override for a group, propagate transform to all descendants.
+        // This allows the AI to position groups as units (typically 5-15 items) instead of
+        // individual layers (often 20-50+), making the task feasible for 8B models.
+        {
+            const overrideMap = new Map<string, LayerOverride>();
+            for (const ov of json.overrides as LayerOverride[]) {
+                overrideMap.set(ov.layerId, ov);
+            }
+
+            const propagatedOverrides: LayerOverride[] = [];
+            const sW = sourceData.container.bounds.w;
+            const sH = sourceData.container.bounds.h;
+            const propScale = Math.min(targetData.bounds.w / sW, targetData.bounds.h / sH);
+
+            for (const ov of json.overrides as LayerOverride[]) {
+                // Check if this override targets a group (has descendants in allLayers)
+                const descendants = allLayers.filter(l => l.id.startsWith(ov.layerId + '.'));
+                if (descendants.length === 0) continue;
+
+                // Compute group's effective origin from descendants' bounding box
+                let groupOriginX = Infinity, groupOriginY = Infinity;
+                for (const desc of descendants) {
+                    if (desc.coords.w > 0 || desc.coords.h > 0) {
+                        groupOriginX = Math.min(groupOriginX, desc.coords.x);
+                        groupOriginY = Math.min(groupOriginY, desc.coords.y);
+                    }
+                }
+                const groupLayer = allLayers.find(l => l.id === ov.layerId);
+                if (groupLayer && groupLayer.coords.w > 0 && groupLayer.coords.h > 0) {
+                    groupOriginX = Math.min(groupOriginX, groupLayer.coords.x);
+                    groupOriginY = Math.min(groupOriginY, groupLayer.coords.y);
+                }
+                if (groupOriginX === Infinity) continue;
+
+                const scale = ov.individualScale ?? propScale;
+                const isBackground = ov.layoutRole === 'background';
+
+                for (const desc of descendants) {
+                    if (overrideMap.has(desc.id)) continue; // AI already overrode this child
+
+                    const dx = desc.coords.x - groupOriginX;
+                    const dy = desc.coords.y - groupOriginY;
+
+                    const childOverride: LayerOverride = {
+                        layerId: desc.id,
+                        layoutRole: isBackground ? 'background' : 'flow',
+                        xOffset: isBackground && ov.scaleX ? dx * ov.scaleX : (ov.xOffset ?? 0) + dx * scale,
+                        yOffset: isBackground && ov.scaleY ? dy * ov.scaleY : (ov.yOffset ?? 0) + dy * scale,
+                        individualScale: isBackground ? (ov.individualScale ?? 1) : scale,
+                    };
+
+                    if (isBackground && ov.scaleX && ov.scaleY) {
+                        childOverride.scaleX = ov.scaleX;
+                        childOverride.scaleY = ov.scaleY;
+                    }
+
+                    propagatedOverrides.push(childOverride);
+                }
+            }
+
+            if (propagatedOverrides.length > 0) {
+                json.overrides = [...json.overrides, ...propagatedOverrides];
+                console.log(`[Analyst] Propagated group overrides → ${propagatedOverrides.length} child overrides`);
+            }
+        }
+
+        // --- COORDINATE SANITY CHECK ---
+        // If AI returned near-zero positions for all non-background layers,
+        // coordinates are likely relative (0-1) instead of absolute pixels.
+        // Recalculate from source layer positions as proportional pixel mapping.
+        {
+            const nonBgOverrides = (json.overrides as LayerOverride[]).filter(
+                o => o.layoutRole !== 'background'
+            );
+            if (nonBgOverrides.length >= 3) {
+                const maxAbsX = Math.max(...nonBgOverrides.map(o => Math.abs(o.xOffset ?? 0)));
+                const maxAbsY = Math.max(...nonBgOverrides.map(o => Math.abs(o.yOffset ?? 0)));
+                const tW = targetData.bounds.w;
+                const tH = targetData.bounds.h;
+                const sX = sourceData.container.bounds.x;
+                const sY = sourceData.container.bounds.y;
+                const sW = sourceData.container.bounds.w;
+                const sH = sourceData.container.bounds.h;
+
+                // If max position < 2% of target dimension, positions are almost certainly invalid
+                if (maxAbsX < tW * 0.02 && maxAbsY < tH * 0.02) {
+                    console.warn(
+                        `[Analyst] SANITY CHECK: Positions appear invalid (max x=${maxAbsX.toFixed(1)}, y=${maxAbsY.toFixed(1)} ` +
+                        `for ${tW}×${tH} target). Recalculating from source layer positions.`
+                    );
+                    const layerCoordsMap = new Map(allLayers.map(l => [l.id, l.coords]));
+                    for (const ov of json.overrides as LayerOverride[]) {
+                        if (ov.layoutRole === 'background') continue;
+                        const coords = layerCoordsMap.get(ov.layerId);
+                        if (coords) {
+                            const relX = (coords.x - sX) / sW;
+                            const relY = (coords.y - sY) / sH;
+                            ov.xOffset = Math.round(relX * tW);
+                            ov.yOffset = Math.round(relY * tH);
+                        }
+                    }
+                }
             }
         }
 
@@ -2087,7 +2135,7 @@ Think: 1) What's here? 2) How to arrange in ${targetW}x${targetH}? 3) What scale
         // ═══════════════════════════════════════════════════════════════════════════════
         let finalStrategy = json;
 
-        if (sourceAnalysis && base64Clean) {
+        if (sourceAnalysis && base64Clean && aiOverrideCount > 0) {
           setAnalysisStages(prev => ({ ...prev, [index]: 'verification' }));
           console.log('[Analyst] Stage 3: Semantic Verification');
 
@@ -2167,6 +2215,8 @@ Think: 1) What's here? 2) How to arrange in ${targetW}x${targetH}? 3) What scale
             console.warn('[Analyst] Stage 3 verification failed, using Stage 2 result:', verifyError);
             // Continue with Stage 2 result if verification fails
           }
+        } else if (aiOverrideCount === 0) {
+          console.log('[Analyst] Skipping Stage 3: AI produced 0 overrides, verification would fail');
         }
 
         setAnalysisStages(prev => ({ ...prev, [index]: 'complete' }));

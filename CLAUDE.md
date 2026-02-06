@@ -195,6 +195,7 @@ Layout strategies include confidence triangulation (`TriangulationAudit`) with v
   - `overlay`: Positioned relative to parent via `linkedAnchorId` — used for companion elements that must move with their anchor
 - **Override validation & default fallback:**
   - If AI misses layers, `inferLayoutRoleFromName()` generates defaults based on name patterns (bg→background, win/counter/text→static, label/badge→overlay, etc.)
+  - **Coordinate sanity check:** After Stage 2, if all non-background xOffset/yOffset values are < 2% of target dimensions, they're treated as invalid (likely relative coords from 8B model). Recalculated from source layer positions as proportional pixel mapping.
   - Invisible layers (`isVisible: false`) are excluded from redistribution
   - Spatial proximity detection runs on ALL layers in fallback — companions are auto-assigned `overlay` + `linkedAnchorId`
   - Only `independentFlowLayers` (non-companion flow elements) participate in gap-based redistribution
@@ -205,9 +206,9 @@ Layout strategies include confidence triangulation (`TriangulationAudit`) with v
 - **Token budget (accounts for Qwen3 thinking overhead):**
   - Ollama maps `max_tokens` → `num_predict`, which caps ALL output tokens (thinking + JSON content)
   - Qwen3-VL uses 2000-8000 thinking tokens before producing JSON, depending on prompt complexity
-  - Stage 1 `maxTokens: 4096` — simple analysis, moderate thinking
+  - Stage 1 `maxTokens: 8192` — 14-field JSON schema with moderate thinking overhead
   - Stage 2 `maxTokens: 16384` — complex layout reasoning, heavy thinking
-  - Stage 3 `maxTokens: 4096` — verification, moderate thinking
+  - Stage 3 `maxTokens: 8192` — verification, moderate-to-heavy thinking
   - `num_ctx: 32768` in `aiProviderService.ts` ensures input + output fit within context window
   - If JSON responses are still truncated, increase `maxTokens` in the relevant `generateCompletion()` call
 - **Token optimization for local models:**

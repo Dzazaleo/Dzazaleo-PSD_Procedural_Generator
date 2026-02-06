@@ -64,7 +64,9 @@
       "Bash(git restore:*)",
       "WebSearch",
       "Bash(ollama --version:*)",
-      "WebFetch(domain:ollama.com)"
+      "WebFetch(domain:ollama.com)",
+      "Bash(git -C \"e:\\\\RANDOM_STUFF\\\\VIBE\\\\PSD_PROCEDURAL_GENERATOR\\\\PSD_Procedural_Generator\" branch -a)",
+      "WebFetch(domain:docs.ollama.com)"
     ]
   }
 }

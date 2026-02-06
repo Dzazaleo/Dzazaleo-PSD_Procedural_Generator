@@ -224,7 +224,7 @@ const calculateOverrideMetrics = (
                     finalY,
                     deltaX: finalX - geomX,
                     deltaY: finalY - geomY,
-                    scale: override.individualScale,
+                    scale: override.individualScale ?? 1,
                     citedRule: override.citedRule,
                     anchorIndex: override.anchorIndex
                 });
@@ -595,7 +595,7 @@ export const RemapperNode = memo(({ id, data }: NodeProps<PSDNodeData>) => {
             if (sourceData.ready && targetData.ready) {
                 // Determine Mode based on Strategy Presence
                 // If the source has an AI Strategy, the Analyst is connected and active.
-                isSemanticMode = !!sourceData.aiStrategy;
+                isSemanticMode = !!(sourceData.aiStrategy?.overrides?.length);
 
                 // Phase 3.2: Merge Strategy with Feedback
                 const feedback = feedbackRegistry?.[id]?.[`result-out-${i}`];
@@ -622,7 +622,7 @@ export const RemapperNode = memo(({ id, data }: NodeProps<PSDNodeData>) => {
                      
                      feedback.overrides.forEach(manual => {
                          if (!mergedOverrides.find(m => m.layerId === manual.layerId)) {
-                             mergedOverrides.push(manual);
+                             mergedOverrides.push({ layoutRole: 'flow' as const, ...manual });
                          }
                      });
 
@@ -878,8 +878,8 @@ export const RemapperNode = memo(({ id, data }: NodeProps<PSDNodeData>) => {
                                     if (sourceOverlay && sourceAnchor) {
                                         const deltaX = sourceOverlay.coords.x - sourceAnchor.coords.x;
                                         const deltaY = sourceOverlay.coords.y - sourceAnchor.coords.y;
-                                        let newX = anchor.coords.x + (deltaX * baseXScale);
-                                        let newY = anchor.coords.y + (deltaY * baseYScale);
+                                        let newX = anchor.coords.x + (deltaX * anchor.transform.scaleX);
+                                        let newY = anchor.coords.y + (deltaY * anchor.transform.scaleY);
 
                                         l.coords.x = newX;
                                         l.coords.y = newY;
@@ -892,7 +892,8 @@ export const RemapperNode = memo(({ id, data }: NodeProps<PSDNodeData>) => {
 
                         // D. BOUNDARY SOLVER (Clipping)
                         if (strategy.physicsRules?.preventClipping) {
-                            transformed.forEach(l => {
+                            const allForBoundary = flattenTransformedTree(transformed);
+                            allForBoundary.forEach(l => {
                                 const isManual = feedback?.overrides.some(o => o.layerId === l.id);
                                 if (isManual) return; 
 

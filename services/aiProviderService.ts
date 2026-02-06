@@ -54,11 +54,14 @@ export interface GenerateResult {
 }
 
 // Default configuration - can be overridden via environment variables
-// qwen3-vl:8b — best quality/VRAM ratio on RTX 3090 Ti (24GB), ~6.1GB weights leaves ~18GB headroom
+// qwen3-vl:8b-instruct — instruct variant (no thinking tokens) for reliable structured JSON output.
+// The thinking variant (qwen3-vl:8b) wastes tokens on <think> blocks that Ollama extracts into a
+// separate 'reasoning' field, often exhausting max_tokens before producing content.
+// Instruct variant has same base model & vision capabilities, ~6.1GB weights (~18GB headroom on 24GB GPU).
 const DEFAULT_CONFIG: AIProviderConfig = {
   provider: (import.meta.env.VITE_AI_PROVIDER as AIProvider) || 'qwen-local',
   baseUrl: import.meta.env.VITE_QWEN_BASE_URL || 'http://localhost:11434/v1',
-  model: import.meta.env.VITE_QWEN_MODEL || 'qwen3-vl:8b',
+  model: import.meta.env.VITE_QWEN_MODEL || 'qwen3-vl:8b-instruct',
   comfyuiUrl: import.meta.env.VITE_COMFYUI_URL || 'http://127.0.0.1:8188',
 };
 
@@ -327,11 +330,13 @@ async function generateWithQwenLocal(options: GenerateOptions): Promise<Generate
 
   // Add structured output guidance if schema provided
   if (options.responseSchema) {
-    // Ollama supports JSON mode via response_format
-    requestBody.response_format = { type: 'json_object' };
+    // NOTE: Do NOT set response_format: { type: 'json_object' } here.
+    // Ollama 0.13+ has bugs with response_format + thinking models (GitHub #10929, #10976).
+    // We use the instruct variant (qwen3-vl:*-instruct) which doesn't think, but
+    // response_format can still cause issues. Schema hint in system prompt works reliably.
 
     // Add JSON instruction with schema to system prompt for guidance
-    const schemaHint = `\n\nIMPORTANT: You MUST respond with valid JSON matching this schema:\n${JSON.stringify(options.responseSchema, null, 2)}`;
+    const schemaHint = `\n\nIMPORTANT: You MUST respond with valid JSON matching this schema. Output ONLY the JSON object, no markdown fences, no explanatory text before or after the JSON:\n${JSON.stringify(options.responseSchema, null, 2)}`;
     if (messages[0]?.role === 'system') {
       messages[0].content += schemaHint;
     } else {
@@ -371,43 +376,108 @@ async function generateWithQwenLocal(options: GenerateOptions): Promise<Generate
   }
 
   const data = await response.json();
+
+  // Diagnostic logging for response structure
+  // Ollama uses 'reasoning' field (not 'reasoning_content') for extracted thinking
+  const msg = data.choices?.[0]?.message;
+  const reasoningText = msg?.reasoning_content || msg?.reasoning || '';
+  console.log(`[Qwen] Response received:`, {
+    hasContent: !!msg?.content,
+    contentLength: msg?.content?.length || 0,
+    hasReasoning: !!reasoningText,
+    reasoningLength: reasoningText.length,
+    finishReason: data.choices?.[0]?.finish_reason,
+    promptTokens: data.usage?.prompt_tokens,
+    completionTokens: data.usage?.completion_tokens,
+  });
+
   let text = data.choices?.[0]?.message?.content || '';
-  // Strip Qwen3's <think>...</think> tags if they leak into content (safety net)
+
+  // Strip Qwen3's <think>...</think> tags if they appear inline in content
+  // (without response_format, thinking appears directly in content)
+  // First: handle properly closed think tags
   text = text.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
+
+  // Second: handle UNCLOSED <think> tags (model truncated during thinking)
+  if (text.includes('<think>')) {
+    console.warn('[Qwen] Unclosed <think> tag detected — stripping thinking block');
+    const thinkIdx = text.indexOf('<think>');
+    const afterThink = text.slice(thinkIdx);
+    const jsonStart = afterThink.indexOf('{');
+    if (jsonStart >= 0) {
+      text = afterThink.slice(jsonStart);
+    } else {
+      console.error('[Qwen] No JSON found after unclosed <think> tag. Full text length:', text.length);
+      text = '';
+    }
+  }
+
+  // Third: handle preamble text without <think> tags (some Ollama versions strip
+  // the tag but leave thinking prose before the JSON object)
+  if (text && !text.startsWith('{') && !text.startsWith('[') && !text.startsWith('```')) {
+    const jsonStart = text.indexOf('{');
+    if (jsonStart > 0) {
+      console.log(`[Qwen] Stripping ${jsonStart} chars of preamble before JSON`);
+      text = text.slice(jsonStart);
+    }
+  }
+
+  // Detect empty response and try reasoning field as fallback
+  if (!text && options.responseSchema) {
+    console.error('[Qwen] EMPTY CONTENT with responseSchema — model produced no content');
+    console.error('[Qwen] Verify model is instruct variant (not thinking variant) and num_ctx is sufficient');
+    if (reasoningText) {
+      console.log('[Qwen] reasoning field present (length:', reasoningText.length, ')');
+      // Try to find JSON embedded in the reasoning/thinking output
+      const jsonMatch = reasoningText.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        console.log('[Qwen] Found JSON in reasoning field, using as fallback');
+        text = jsonMatch[0];
+      }
+    }
+  }
 
   // Try to parse as JSON if schema was provided
   let json: any = undefined;
   if (options.responseSchema) {
-    try {
-      // Handle potential markdown code blocks
-      let jsonText = text;
-      const jsonMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
-      if (jsonMatch) {
-        jsonText = jsonMatch[1].trim();
-      }
-      json = JSON.parse(jsonText);
-    } catch (e) {
-      console.warn('Failed to parse JSON response:', e);
-      // Try to extract JSON from the text
-      const jsonStart = text.indexOf('{');
-      const jsonEnd = text.lastIndexOf('}');
-      if (jsonStart !== -1 && jsonEnd !== -1) {
-        try {
-          json = JSON.parse(text.slice(jsonStart, jsonEnd + 1));
-        } catch (e2) {
-          console.warn('JSON extraction failed, attempting truncation repair...');
-          // Attempt to repair truncated JSON (model ran out of output tokens)
-          const repaired = repairTruncatedJson(text);
-          if (repaired) {
-            console.log('JSON repair succeeded — output was likely truncated by maxTokens');
-            console.log('Recovered keys:', Object.keys(repaired));
-            if (repaired.overrides) {
-              console.log('Recovered', repaired.overrides.length, 'overrides from truncated response');
+    if (!text || text.trim().length === 0) {
+      console.error('[Qwen] No content to parse for JSON. Response was empty after stripping.');
+      console.error('[Qwen] Raw response sample:', JSON.stringify(data.choices?.[0]?.message).slice(0, 500));
+    } else {
+      try {
+        // Handle potential markdown code blocks
+        let jsonText = text;
+        const jsonMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+        if (jsonMatch) {
+          jsonText = jsonMatch[1].trim();
+        }
+        json = JSON.parse(jsonText);
+      } catch (e) {
+        console.warn('[Qwen] Failed to parse JSON response:', e);
+        // Try to extract JSON from the text
+        const jsonStart = text.indexOf('{');
+        const jsonEnd = text.lastIndexOf('}');
+        if (jsonStart !== -1 && jsonEnd !== -1 && jsonEnd > jsonStart) {
+          try {
+            json = JSON.parse(text.slice(jsonStart, jsonEnd + 1));
+          } catch (e2) {
+            console.warn('[Qwen] JSON extraction failed, attempting truncation repair...');
+            // Attempt to repair truncated JSON (model ran out of output tokens)
+            const repaired = repairTruncatedJson(text);
+            if (repaired) {
+              console.log('[Qwen] JSON repair succeeded — output was likely truncated by maxTokens');
+              console.log('[Qwen] Recovered keys:', Object.keys(repaired));
+              if (repaired.overrides) {
+                console.log('[Qwen] Recovered', repaired.overrides.length, 'overrides from truncated response');
+              }
+              json = repaired;
+            } else {
+              console.error('[Qwen] JSON repair also failed. Raw text length:', text.length);
+              console.error('[Qwen] First 200 chars:', text.slice(0, 200));
             }
-            json = repaired;
-          } else {
-            console.error('JSON repair also failed. Raw text length:', text.length);
           }
+        } else {
+          console.error('[Qwen] No JSON object found in response text. First 200 chars:', text.slice(0, 200));
         }
       }
     }
