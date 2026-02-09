@@ -1,6 +1,6 @@
 import React, { createContext, useContext, useState, useCallback, useMemo } from 'react';
 import { Psd } from 'ag-psd';
-import { TemplateMetadata, MappingContext, TransformedPayload, LayoutStrategy, KnowledgeContext, KnowledgeRegistry, FeedbackStrategy, FeedbackRegistry, SerializableLayer } from '../types';
+import { TemplateMetadata, MappingContext, TransformedPayload, KnowledgeContext, KnowledgeRegistry, FeedbackStrategy, FeedbackRegistry, SerializableLayer } from '../types';
 import { calculateGroupBounds } from '../services/psdService';
 import { SmartObjectRegistry } from '../services/smartObjectRegistry';
 
@@ -25,9 +25,6 @@ interface ProceduralState {
   // Specific registry for caching the visual renders from ContainerPreviewNode
   previewRegistry: Record<string, Record<string, string>>;
 
-  // Maps NodeID -> HandleID -> LayoutStrategy (AI Analysis)
-  analysisRegistry: Record<string, Record<string, LayoutStrategy>>;
-
   // Maps NodeID -> HandleID -> FeedbackStrategy (Reviewer Constraints)
   // Stores hard constraints sent back from Reviewer to Remapper
   feedbackRegistry: FeedbackRegistry;
@@ -45,9 +42,9 @@ interface ProceduralContextType extends ProceduralState {
   registerResolved: (nodeId: string, handleId: string, context: MappingContext) => void;
   registerPayload: (nodeId: string, handleId: string, payload: TransformedPayload, masterOverride?: boolean) => void;
   registerReviewerPayload: (nodeId: string, handleId: string, payload: TransformedPayload) => void;
+  clearReviewerPayload: (nodeId: string, handleId: string) => void;
   registerPreviewPayload: (nodeId: string, handleId: string, payload: TransformedPayload, renderUrl: string) => void;
-  updatePayload: (nodeId: string, handleId: string, partial: Partial<TransformedPayload>) => void; 
-  registerAnalysis: (nodeId: string, handleId: string, strategy: LayoutStrategy) => void;
+  updatePayload: (nodeId: string, handleId: string, partial: Partial<TransformedPayload>) => void;
   registerFeedback: (nodeId: string, handleId: string, strategy: FeedbackStrategy) => void;
   clearFeedback: (nodeId: string, handleId: string) => void;
   registerKnowledge: (nodeId: string, context: KnowledgeContext) => void;
@@ -202,7 +199,6 @@ export const ProceduralStoreProvider: React.FC<{ children: React.ReactNode }> = 
   const [payloadRegistry, setPayloadRegistry] = useState<Record<string, Record<string, TransformedPayload>>>({});
   const [reviewerRegistry, setReviewerRegistry] = useState<Record<string, Record<string, TransformedPayload>>>({});
   const [previewRegistry, setPreviewRegistry] = useState<Record<string, Record<string, string>>>({});
-  const [analysisRegistry, setAnalysisRegistry] = useState<Record<string, Record<string, LayoutStrategy>>>({});
   const [feedbackRegistry, setFeedbackRegistry] = useState<FeedbackRegistry>({});
   const [knowledgeRegistry, setKnowledgeRegistry] = useState<KnowledgeRegistry>({});
   const [globalVersion, setGlobalVersion] = useState<number>(0);
@@ -301,6 +297,20 @@ export const ProceduralStoreProvider: React.FC<{ children: React.ReactNode }> = 
     });
   }, []);
 
+  const clearReviewerPayload = useCallback((nodeId: string, handleId: string) => {
+    setReviewerRegistry(prev => {
+        if (!prev[nodeId]) return prev;
+        const nodeRecord = prev[nodeId];
+        if (!nodeRecord[handleId]) return prev;
+
+        const { [handleId]: _, ...rest } = nodeRecord;
+        return {
+            ...prev,
+            [nodeId]: rest
+        };
+    });
+  }, []);
+
   const registerPreviewPayload = useCallback((nodeId: string, handleId: string, payload: TransformedPayload, renderUrl: string) => {
     // 1. Store Render in Preview Registry (Visual State Only)
     setPreviewRegistry(prev => {
@@ -365,24 +375,6 @@ export const ProceduralStoreProvider: React.FC<{ children: React.ReactNode }> = 
             [handleId]: reconciledPayload
         } 
       };
-    });
-  }, []);
-
-  const registerAnalysis = useCallback((nodeId: string, handleId: string, strategy: LayoutStrategy) => {
-    setAnalysisRegistry(prev => {
-        const nodeRecord = prev[nodeId] || {};
-        const currentStrategy = nodeRecord[handleId];
-        
-        if (currentStrategy === strategy) return prev;
-        if (currentStrategy && JSON.stringify(currentStrategy) === JSON.stringify(strategy)) return prev;
-        
-        return { 
-            ...prev, 
-            [nodeId]: {
-                ...nodeRecord,
-                [handleId]: strategy
-            } 
-        };
     });
   }, []);
 
@@ -456,7 +448,6 @@ export const ProceduralStoreProvider: React.FC<{ children: React.ReactNode }> = 
     setResolvedRegistry(prev => { const { [nodeId]: _, ...rest } = prev; return rest; });
     setPayloadRegistry(prev => { const { [nodeId]: _, ...rest } = prev; return rest; });
     setReviewerRegistry(prev => { const { [nodeId]: _, ...rest } = prev; return rest; });
-    setAnalysisRegistry(prev => { const { [nodeId]: _, ...rest } = prev; return rest; });
     setFeedbackRegistry(prev => { const { [nodeId]: _, ...rest } = prev; return rest; });
     
     setKnowledgeRegistry(prev => { 
@@ -497,9 +488,8 @@ export const ProceduralStoreProvider: React.FC<{ children: React.ReactNode }> = 
       clearEntry(payloadRegistry, setPayloadRegistry);
       clearEntry(reviewerRegistry, setReviewerRegistry);
       clearEntry(previewRegistry, setPreviewRegistry);
-      clearEntry(analysisRegistry, setAnalysisRegistry);
       clearEntry(feedbackRegistry, setFeedbackRegistry);
-  }, [resolvedRegistry, payloadRegistry, reviewerRegistry, previewRegistry, analysisRegistry, feedbackRegistry]);
+  }, [resolvedRegistry, payloadRegistry, reviewerRegistry, previewRegistry, feedbackRegistry]);
 
   const triggerGlobalRefresh = useCallback(() => {
     setGlobalVersion(v => v + 1);
@@ -516,7 +506,6 @@ export const ProceduralStoreProvider: React.FC<{ children: React.ReactNode }> = 
     setPayloadRegistry({});
     setReviewerRegistry({});
     setPreviewRegistry({});
-    setAnalysisRegistry({});
     setFeedbackRegistry({});
     setKnowledgeRegistry({});
     
@@ -537,7 +526,6 @@ export const ProceduralStoreProvider: React.FC<{ children: React.ReactNode }> = 
     payloadRegistry,
     reviewerRegistry,
     previewRegistry,
-    analysisRegistry,
     feedbackRegistry,
     knowledgeRegistry,
     globalVersion,
@@ -546,9 +534,9 @@ export const ProceduralStoreProvider: React.FC<{ children: React.ReactNode }> = 
     registerResolved,
     registerPayload,
     registerReviewerPayload,
+    clearReviewerPayload,
     registerPreviewPayload,
-    updatePayload, 
-    registerAnalysis,
+    updatePayload,
     registerFeedback,
     clearFeedback,
     registerKnowledge,
@@ -558,8 +546,8 @@ export const ProceduralStoreProvider: React.FC<{ children: React.ReactNode }> = 
     triggerGlobalRefresh,
     resetProject
   }), [
-    psdRegistry, templateRegistry, resolvedRegistry, payloadRegistry, reviewerRegistry, previewRegistry, analysisRegistry, feedbackRegistry, knowledgeRegistry, globalVersion,
-    registerPsd, registerTemplate, registerResolved, registerPayload, registerReviewerPayload, registerPreviewPayload, updatePayload, registerAnalysis, registerFeedback, clearFeedback, registerKnowledge, updatePreview,
+    psdRegistry, templateRegistry, resolvedRegistry, payloadRegistry, reviewerRegistry, previewRegistry, feedbackRegistry, knowledgeRegistry, globalVersion,
+    registerPsd, registerTemplate, registerResolved, registerPayload, registerReviewerPayload, clearReviewerPayload, registerPreviewPayload, updatePayload, registerFeedback, clearFeedback, registerKnowledge, updatePreview,
     unregisterNode, flushPipelineInstance, triggerGlobalRefresh, resetProject
   ]);
 

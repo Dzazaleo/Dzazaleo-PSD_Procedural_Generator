@@ -686,6 +686,7 @@ export const RemapperNode = memo(({ id, data }: NodeProps<PSDNodeData>) => {
                                 ...layer,
                                 type: 'generative',
                                 generativePrompt: strategy.generativePrompt,
+                                sourceCoords: { x: layer.coords.x, y: layer.coords.y, w: layer.coords.w, h: layer.coords.h },
                                 coords: { x: targetRect.x, y: targetRect.y, w: targetRect.w, h: targetRect.h },
                                 transform: { scaleX: 1, scaleY: 1, offsetX: targetRect.x, offsetY: targetRect.y },
                                 children: undefined
@@ -805,6 +806,7 @@ export const RemapperNode = memo(({ id, data }: NodeProps<PSDNodeData>) => {
                             layoutRole: role,
                             linkedAnchorId: override?.linkedAnchorId,
                             citedRule: override?.citedRule,
+                            sourceCoords: { x: layer.coords.x, y: layer.coords.y, w: layer.coords.w, h: layer.coords.h },
                             coords: { x: finalX, y: finalY, w: scaledW, h: scaledH },
                             transform: { scaleX: layerScaleX, scaleY: layerScaleY, offsetX: finalX, offsetY: finalY },
                             children: layer.children ? transformLayers(layer.children, depth + 1, 0, 0) : undefined
@@ -964,7 +966,10 @@ export const RemapperNode = memo(({ id, data }: NodeProps<PSDNodeData>) => {
                     replaceLayerId: strategy?.replaceLayerId,
                     triangulation: strategy?.triangulation,
                     // Pass strategy to payload for downstream awareness
-                    activeStrategy: layoutMode
+                    activeStrategy: layoutMode,
+                    // Quality Enforcement: Source comprehension and bounds for Reviewer
+                    sourceAnalysis: sourceData.aiStrategy?.sourceAnalysis,
+                    sourceContainerBounds: { x: sourceRect.x, y: sourceRect.y, w: sourceRect.w, h: sourceRect.h }
                 };
             }
             result.push({ index: i, source: sourceData, target: targetData, payload, strategyUsed, isSemanticMode });

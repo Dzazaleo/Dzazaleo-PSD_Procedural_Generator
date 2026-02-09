@@ -1,14 +1,17 @@
 
 import React, { memo, useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { Handle, Position, NodeProps, useReactFlow, useUpdateNodeInternals, useEdges, useNodes } from 'reactflow';
-import { PSDNodeData, TransformedPayload, LayerOverride, ChatMessage, ReviewerStrategy, ReviewerInstanceState, TransformedLayer, FeedbackStrategy } from '../types';
+import { PSDNodeData, TransformedPayload, LayerOverride, ChatMessage, ReviewerStrategy, ReviewerInstanceState, TransformedLayer, FeedbackStrategy, QualityReport } from '../types';
 import { useProceduralStore } from '../store/ProceduralContext';
 import { generateCompletion, StructuredOutputSchema } from '../services/aiProviderService';
-import { Check, MessageSquare, AlertCircle, ShieldCheck, Search, Activity, Brain, Ban, Link as LinkIcon, Layers, Lock, Move, Anchor, Zap, RotateCcw } from 'lucide-react';
+import { Check, MessageSquare, AlertCircle, ShieldCheck, Search, Activity, Brain, Ban, Link as LinkIcon, Layers, Lock, Move, Anchor, Zap, RotateCcw, AlertTriangle, CheckCircle2 } from 'lucide-react';
+import { runQualityEnforcement, extractCorrectiveOverrides } from '../services/qualityEnforcement';
 
 const DEFAULT_INSTANCE_STATE: ReviewerInstanceState = {
     chatHistory: [],
-    reviewerStrategy: null
+    reviewerStrategy: null,
+    qualityReport: null,
+    hasAutoCorrected: false
 };
 
 interface SemanticBadgeProps {
@@ -93,15 +96,16 @@ const checkSynchronization = (payload: TransformedPayload | null, strategy: Revi
     return true;
 };
 
-const ReviewerInstanceRow = memo(({ 
-    index, instanceState, payload, onChat, onVerify, onCommit, onReset, isPolished, isAnalyzing, isSyncing, activeKnowledge 
-}: { 
-    index: number, instanceState: ReviewerInstanceState, payload: TransformedPayload | null, onChat: (idx: number, msg: string) => void, onVerify: (idx: number) => void, onCommit: (idx: number) => void, onReset: (idx: number) => void, isPolished: boolean, isAnalyzing: boolean, isSyncing: boolean, activeKnowledge: any 
+const ReviewerInstanceRow = memo(({
+    index, instanceState, payload, onChat, onVerify, onCommit, onReset, onAutoCorrect, onQualityReport, isPolished, isAnalyzing, isSyncing, activeKnowledge
+}: {
+    index: number, instanceState: ReviewerInstanceState, payload: TransformedPayload | null, onChat: (idx: number, msg: string) => void, onVerify: (idx: number) => void, onCommit: (idx: number) => void, onReset: (idx: number) => void, onAutoCorrect?: (idx: number, corrections: LayerOverride[], report: QualityReport) => void, onQualityReport?: (idx: number, report: QualityReport) => void, isPolished: boolean, isAnalyzing: boolean, isSyncing: boolean, activeKnowledge: any
 }) => {
     const [inputValue, setInputValue] = useState("");
     const [isInspectorOpen, setInspectorOpen] = useState(false);
     const [isSynced, setIsSynced] = useState<boolean>(true);
     const chatEndRef = useRef<HTMLDivElement>(null);
+    const lastReportSigRef = useRef<string | null>(null);
     
     // Phase 3b: Confidence Visualization
     const triangulation = payload?.triangulation;
@@ -112,23 +116,47 @@ const ReviewerInstanceRow = memo(({
     
     const hasStrategy = !!instanceState.reviewerStrategy?.overrides?.length;
 
-    // Detect Synchronization Status & Auto-Verify
+    // Stable refs for callbacks used in the effect (avoids identity-change re-triggers)
+    const onAutoCorrectRef = useRef(onAutoCorrect);
+    onAutoCorrectRef.current = onAutoCorrect;
+    const onQualityReportRef = useRef(onQualityReport);
+    onQualityReportRef.current = onQualityReport;
+
+    // Detect Synchronization Status & Quality-Gated Auto-Verify
     useEffect(() => {
         const synced = checkSynchronization(payload, instanceState.reviewerStrategy);
         setIsSynced(synced);
 
-        // Auto-Verification Logic:
-        // If we have explicit overrides (hasStrategy) AND they are fully synced (synced) AND not yet verified (!isPolished),
-        // we automatically verify the result to unlock the export gate.
-        if (synced && hasStrategy && !isPolished && payload) {
-            // We use a small delay to allow the "Synced" visual state to be seen briefly 
-            // and to ensure render stability before triggering the update.
-            const timer = setTimeout(() => {
-                onVerify(index);
-            }, 800);
-            return () => clearTimeout(timer);
+        if (payload && payload.layers.length > 0) {
+            const report = runQualityEnforcement(payload, payload.sourceAnalysis);
+
+            // Deduplicate: only push report upstream if it meaningfully changed
+            const reportSig = `${report.score}:${report.violations.length}`;
+            if (reportSig !== lastReportSigRef.current) {
+                lastReportSigRef.current = reportSig;
+                onQualityReportRef.current?.(index, report);
+            }
+
+            // Auto-correction (single-shot guard)
+            const hasErrors = report.violations.some(v => v.severity === 'error');
+            if (hasErrors && !instanceState.hasAutoCorrected) {
+                const corrections = extractCorrectiveOverrides(report);
+                if (corrections.length > 0) {
+                    console.log(`[Reviewer] Quality enforcement: ${corrections.length} corrections for instance ${index}`);
+                    onAutoCorrectRef.current?.(index, corrections, report);
+                    return; // Wait for corrected payload
+                }
+            }
+
+            // Auto-verify if quality >= 60 AND (synced with strategy OR no manual strategy)
+            const qualityOk = report.score >= 60;
+            const canAutoVerify = qualityOk && !isPolished && payload;
+            if (canAutoVerify && ((synced && hasStrategy) || !hasStrategy)) {
+                const timer = setTimeout(() => onVerify(index), 800);
+                return () => clearTimeout(timer);
+            }
         }
-    }, [payload, instanceState.reviewerStrategy, isPolished, hasStrategy, onVerify, index]);
+    }, [payload, instanceState.reviewerStrategy, instanceState.hasAutoCorrected, isPolished, hasStrategy, onVerify, index]);
 
     useEffect(() => {
         chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -273,6 +301,48 @@ const ReviewerInstanceRow = memo(({
                 </div>
             )}
 
+            {/* Quality Report Panel */}
+            {instanceState.qualityReport && (
+                <div className="px-3 pb-2">
+                    <div className="flex items-center gap-2 mb-1.5">
+                        {/* Quality Score Badge */}
+                        <div className={`flex items-center gap-1 px-2 py-0.5 rounded border text-[9px] font-bold uppercase tracking-wider ${
+                            instanceState.qualityReport.score >= 80
+                                ? 'bg-emerald-900/30 text-emerald-300 border-emerald-500/30'
+                                : instanceState.qualityReport.score >= 50
+                                    ? 'bg-yellow-900/30 text-yellow-300 border-yellow-500/30'
+                                    : 'bg-red-900/30 text-red-300 border-red-500/30'
+                        }`}>
+                            {instanceState.qualityReport.score >= 80 ? <CheckCircle2 className="w-3 h-3" /> : <AlertTriangle className="w-3 h-3" />}
+                            <span>QA {instanceState.qualityReport.score}/100</span>
+                        </div>
+                        <span className="text-[8px] text-slate-500 font-mono">
+                            {instanceState.qualityReport.passedChecks}/{instanceState.qualityReport.totalChecks} checks passed
+                        </span>
+                        {instanceState.qualityReport.wasAutoCorrected && (
+                            <span className="text-[8px] text-amber-400 font-bold uppercase tracking-wider animate-pulse">Auto-corrected</span>
+                        )}
+                    </div>
+                    {/* Violations List */}
+                    {instanceState.qualityReport.violations.length > 0 && (
+                        <div className="bg-slate-900/50 border border-slate-700 rounded max-h-24 overflow-y-auto custom-scrollbar">
+                            {instanceState.qualityReport.violations.map((v, vi) => (
+                                <div key={vi} className="flex items-start gap-1.5 px-2 py-1 border-b border-slate-800 last:border-0">
+                                    {v.severity === 'error'
+                                        ? <AlertCircle className="w-2.5 h-2.5 text-red-400 mt-0.5 shrink-0" />
+                                        : <AlertTriangle className="w-2.5 h-2.5 text-yellow-400 mt-0.5 shrink-0" />
+                                    }
+                                    <div className="min-w-0">
+                                        <span className="text-[8px] text-slate-400 font-mono block truncate">{v.layerName}</span>
+                                        <span className="text-[8px] text-slate-500 block">{v.message}</span>
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                    )}
+                </div>
+            )}
+
             {/* Manual Control / Chat Interface */}
             <div className="px-3 pb-3">
                 {instanceState.chatHistory.length > 0 && (
@@ -321,9 +391,12 @@ export const DesignReviewerNode = memo(({ id, data }: NodeProps<PSDNodeData>) =>
     const edges = useEdges();
     const { setNodes } = useReactFlow();
     const updateNodeInternals = useUpdateNodeInternals();
-    const { payloadRegistry, updatePayload, unregisterNode, knowledgeRegistry, registerFeedback, clearFeedback } = useProceduralStore();
+    const { payloadRegistry, updatePayload, unregisterNode, knowledgeRegistry, registerFeedback, clearFeedback, registerReviewerPayload, clearReviewerPayload } = useProceduralStore();
     const [analyzingInstances, setAnalyzingInstances] = useState<Record<number, boolean>>({});
     const [syncingInstances, setSyncingInstances] = useState<Record<number, boolean>>({});
+    const reviewerInstancesRef = useRef(data.reviewerInstances || {});
+    reviewerInstancesRef.current = data.reviewerInstances || {};
+    const prevUpstreamRef = useRef<Record<number, { nodeId: string; handleId: string } | null>>({});
 
     const hasFunctionalInput = useMemo(() => {
         return edges.some(e => e.target === id && e.targetHandle !== 'knowledge-in');
@@ -384,6 +457,51 @@ export const DesignReviewerNode = memo(({ id, data }: NodeProps<PSDNodeData>) =>
             clearFeedback(upstream.nodeId, upstream.handleId);
         }
     }, [updateInstanceState, findUpstreamRemapper, clearFeedback]);
+
+    // Edge-disconnect cleanup: clear stale feedback when Reviewer↔Remapper edge is removed or changed
+    useEffect(() => {
+        const currentUpstream: Record<number, { nodeId: string; handleId: string } | null> = {};
+        for (const i of effectiveIndices) {
+            const edge = edges.find(e => e.target === id && e.targetHandle === `source-in-${i}`);
+            currentUpstream[i] = edge ? { nodeId: edge.source, handleId: edge.sourceHandle || '' } : null;
+        }
+
+        const prev = prevUpstreamRef.current;
+        for (const i of effectiveIndices) {
+            const old = prev[i];
+            const cur = currentUpstream[i];
+            if (old && (!cur || old.nodeId !== cur.nodeId || old.handleId !== cur.handleId)) {
+                // Upstream was removed or changed — clear stale feedback on the OLD remapper
+                console.log(`[Reviewer] Edge disconnect detected for instance ${i}. Clearing feedback on ${old.nodeId}:${old.handleId}`);
+                clearFeedback(old.nodeId, old.handleId);
+            }
+        }
+
+        prevUpstreamRef.current = currentUpstream;
+    }, [edges, id, effectiveIndices, clearFeedback]);
+
+    const handleAutoCorrect = useCallback((index: number, corrections: LayerOverride[], report: QualityReport) => {
+        updateInstanceState(index, {
+            hasAutoCorrected: true,
+            qualityReport: { ...report, wasAutoCorrected: true }
+        });
+
+        const upstream = findUpstreamRemapper(index);
+        if (!upstream) return;
+
+        registerFeedback(upstream.nodeId, upstream.handleId, {
+            overrides: corrections,
+            isCommitted: true
+        });
+        console.log(`[Reviewer] Auto-correcting ${corrections.length} layers -> Remapper ${upstream.nodeId}`);
+    }, [updateInstanceState, findUpstreamRemapper, registerFeedback]);
+
+    const handleQualityReport = useCallback((index: number, report: QualityReport) => {
+        const existing = (reviewerInstancesRef.current)[index]?.qualityReport;
+        // Deduplicate: skip if score and violation count are unchanged
+        if (existing && existing.score === report.score && existing.violations.length === report.violations.length) return;
+        updateInstanceState(index, { qualityReport: report });
+    }, [updateInstanceState]);
 
     const performManualAudit = async (index: number, userMessage: string, currentHistory: ChatMessage[], payload: TransformedPayload) => {
         setAnalyzingInstances(prev => ({ ...prev, [index]: true }));
@@ -564,8 +682,17 @@ CRITICAL MATH RULES:
         // "Verify" passes the payload through as 'polished' without changing geometry.
         const edge = edges.find(e => e.target === id && e.targetHandle === `source-in-${index}`);
         const sourcePayload = edge ? payloadRegistry[edge.source]?.[edge.sourceHandle || ''] : null;
+        const instanceState = (data.reviewerInstances || {})[index] || DEFAULT_INSTANCE_STATE;
 
         if (sourcePayload) {
+            // Block verification if quality score is critically low and we have source analysis
+            if (instanceState.qualityReport && instanceState.qualityReport.score < 40 && sourcePayload.sourceAnalysis) {
+                console.warn(`[Reviewer] Verification blocked: quality score ${instanceState.qualityReport.score}/100`);
+                return;
+            }
+            // Write to reviewerRegistry (what ExportPSD reads) — forces isPolished: true
+            registerReviewerPayload(id, `result-out-${index}`, { ...sourcePayload, status: 'success' });
+            // Keep updatePayload for payloadRegistry (Reviewer's own UI + Preview fallback)
             updatePayload(id, `result-out-${index}`, {
                 ...sourcePayload,
                 isPolished: true,
@@ -603,14 +730,21 @@ CRITICAL MATH RULES:
                     // Propagate the update
                     // NOTE: We strip 'isPolished' to false because any geometric change invalidates previous verification.
                     // This forces the user to re-verify if they nudge things.
-                    updatePayload(id, `result-out-${i}`, { 
-                        ...sourcePayload, 
-                        isPolished: false 
+                    updatePayload(id, `result-out-${i}`, {
+                        ...sourcePayload,
+                        isPolished: false
                     });
+                    // Clear stale polished entry from reviewerRegistry so ExportPSD won't use outdated data
+                    clearReviewerPayload(id, `result-out-${i}`);
+                    // Reset single-shot auto-correction guard so new upstream data gets a fresh correction attempt
+                    const currentState = reviewerInstancesRef.current[i];
+                    if (currentState?.hasAutoCorrected) {
+                        updateInstanceState(i, { hasAutoCorrected: false, qualityReport: null });
+                    }
                 }
             }
         }
-    }, [edges, id, effectiveIndices, payloadRegistry, updatePayload]);
+    }, [edges, id, effectiveIndices, payloadRegistry, updatePayload, clearReviewerPayload, updateInstanceState]);
 
     const addInstance = () => {
         setNodes((nds) => nds.map((n) => {
@@ -647,7 +781,7 @@ CRITICAL MATH RULES:
                     return (
                         <div key={i} className="relative">
                             <Handle type="target" position={Position.Left} id={`source-in-${i}`} className="!absolute !-left-2 !top-8 !w-3 !h-3 !rounded-full !bg-purple-500 !border-2 !border-slate-800 z-50" />
-                            <ReviewerInstanceRow 
+                            <ReviewerInstanceRow
                                 index={i}
                                 instanceState={instanceState}
                                 payload={sourcePayload}
@@ -655,6 +789,8 @@ CRITICAL MATH RULES:
                                 onVerify={handleVerify}
                                 onCommit={handleCommit}
                                 onReset={handleReset}
+                                onAutoCorrect={handleAutoCorrect}
+                                onQualityReport={handleQualityReport}
                                 isPolished={isPolished}
                                 isAnalyzing={!!analyzingInstances[i]}
                                 isSyncing={!!syncingInstances[i]}

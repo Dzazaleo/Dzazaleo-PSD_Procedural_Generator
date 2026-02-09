@@ -37,7 +37,6 @@ LoadPSD → DesignInfo/TemplateSplitter → ContainerResolver → DesignAnalyst 
 - `resolvedRegistry`: Container-to-layer mapping contexts
 - `payloadRegistry`: Transformed layer payloads ready for assembly
 - `reviewerRegistry`: CARO-audited (polished) payloads
-- `analysisRegistry`: AI layout strategies
 - `feedbackRegistry`: Reviewer→Remapper constraint feedback
 - `knowledgeRegistry`: Design rules and visual anchors
 

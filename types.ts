@@ -180,6 +180,9 @@ export interface LayoutStrategy {
       preventOverlap?: boolean;
       preventClipping?: boolean;
   };
+
+  // Quality Enforcement: Stage 1 comprehension attached for downstream reviewer
+  sourceAnalysis?: SourceAnalysis;
 }
 
 // --- PHASE 2: 3-STAGE SEMANTIC PIPELINE ---
@@ -271,6 +274,9 @@ export interface TransformedLayer extends SerializableLayer {
   layoutRole?: 'flow' | 'static' | 'overlay' | 'background';
   linkedAnchorId?: string;
   citedRule?: string;
+
+  // Quality Enforcement: Original source-space coordinates before transform
+  sourceCoords?: { x: number; y: number; w: number; h: number };
 }
 
 export interface MappingContext {
@@ -340,8 +346,12 @@ export interface TransformedPayload {
   directives?: string[]; 
   isMandatory?: boolean; 
   
-  replaceLayerId?: string | null; 
-  triangulation?: TriangulationAudit; 
+  replaceLayerId?: string | null;
+  triangulation?: TriangulationAudit;
+
+  // Quality Enforcement: Source comprehension and container bounds for Reviewer
+  sourceAnalysis?: SourceAnalysis;
+  sourceContainerBounds?: { x: number; y: number; w: number; h: number };
 }
 
 export interface RemapperConfig {
@@ -371,6 +381,26 @@ export interface AnalystInstanceState {
 export interface ReviewerInstanceState {
   chatHistory: ChatMessage[];
   reviewerStrategy: ReviewerStrategy | null;
+  qualityReport?: QualityReport | null;
+  hasAutoCorrected?: boolean;
+}
+
+export interface QualityViolation {
+  layerId: string;
+  layerName: string;
+  checkType: 'POSITION_DRIFT' | 'MUST_PRESERVE_OFFSCREEN' | 'GROUP_COHESION' | 'BACKGROUND_COVERAGE' | 'OFFSCREEN';
+  severity: 'error' | 'warning';
+  message: string;
+  correctedOverride?: LayerOverride;
+}
+
+export interface QualityReport {
+  score: number;
+  violations: QualityViolation[];
+  passedChecks: number;
+  totalChecks: number;
+  timestamp: number;
+  wasAutoCorrected: boolean;
 }
 
 export interface InspectorState {

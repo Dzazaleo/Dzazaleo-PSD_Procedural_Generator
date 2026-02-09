@@ -25,6 +25,30 @@ const MAX_LAYER_DEPTH = 3;
 const MAX_LAYERS_IN_PROMPT = 20;
 const DRAFT_DEBOUNCE_MS = 500;
 
+// --- LAYERED DEFENSE CONSTANTS ---
+// Layer 0: Fast Path Monitoring
+const FAST_PATH_ASPECT_TOLERANCE = 0.15;
+const FAST_PATH_SCALE_MIN = 0.8;
+const FAST_PATH_SCALE_MAX = 1.3;
+const ENABLE_FAST_PATH_AUTO_SKIP = false; // Monitor only (default)
+
+// Layer 1: Quality Gate (Penalty Scoring)
+const QUALITY_GATE_ORIGIN_THRESHOLD_PX = 2;
+const QUALITY_GATE_DUPLICATE_THRESHOLD = 0.7;      // Min unique positions ratio
+const QUALITY_GATE_OVERFLOW_THRESHOLD = 0.3;        // Max overflow proportion
+const QUALITY_GATE_BUNCHED_AREA_THRESHOLD = 0.2;    // Min layer-inclusive bbox area ratio
+const QUALITY_GATE_OFFSCREEN_THRESHOLD = 0.8;       // Max invisible area ratio per layer
+const QUALITY_GATE_EXTREME_SCALE_MIN = 0.1;
+const QUALITY_GATE_EXTREME_SCALE_MAX = 5.0;
+const QUALITY_GATE_PENALTY_THRESHOLD = 3;           // Combined score to trigger fallback
+
+// Layer 2: Confidence Gate
+const STAGE3_CONFIDENCE_THRESHOLD = 0.5;
+
+// Telemetry
+const ENABLE_TELEMETRY_LOGGING = true;       // Console logging
+const ENABLE_TELEMETRY_PERSISTENCE = false;  // localStorage (future)
+
 // Helper function to infer layout role from layer name
 const inferLayoutRoleFromName = (name: string): 'flow' | 'static' | 'overlay' | 'background' => {
   const lower = name.toLowerCase();
@@ -50,6 +74,49 @@ const MODELS: Record<ModelKey, { badgeClass: string; label: string }> = {
 };
 
 const getModelKey = (_value: string | undefined): ModelKey => 'qwen-local';
+
+// --- TELEMETRY SYSTEM ---
+interface DefenseTelemetry {
+  timestamp: number;
+  containerName: string;
+  sourceDims: { w: number; h: number };
+  targetDims: { w: number; h: number };
+  aspectRatioDiff: number;
+  scaleFactor: number;
+  layer: 'FAST_PATH_ELIGIBLE' | 'QUALITY_GATE' | 'CONFIDENCE_GATE' | 'DIM_AWARE_CLAMP';
+  trigger: string;
+  aiOverrideCount?: number;
+  confidence?: number;
+}
+
+const sessionTelemetry: DefenseTelemetry[] = [];
+const confidenceStats = { min: 1, max: 0, count: 0, sum: 0 };
+
+const logDefenseTrigger = (telemetry: DefenseTelemetry) => {
+  if (!ENABLE_TELEMETRY_LOGGING) return;
+  sessionTelemetry.push(telemetry);
+
+  const { layer, trigger, containerName, aspectRatioDiff, scaleFactor } = telemetry;
+  console.log(
+    `[${layer}] ${containerName} | ${trigger} | ` +
+    `ratio-diff=${aspectRatioDiff.toFixed(3)} scale=${scaleFactor.toFixed(3)}`
+  );
+};
+
+const logConfidence = (containerName: string, confidence: number) => {
+  confidenceStats.min = Math.min(confidenceStats.min, confidence);
+  confidenceStats.max = Math.max(confidenceStats.max, confidence);
+  confidenceStats.count += 1;
+  confidenceStats.sum += confidence;
+
+  if (ENABLE_TELEMETRY_LOGGING) {
+    const avg = confidenceStats.sum / confidenceStats.count;
+    console.log(
+      `[CONFIDENCE] ${containerName} | score=${confidence.toFixed(2)} | ` +
+      `session: min=${confidenceStats.min.toFixed(2)} avg=${avg.toFixed(2)} max=${confidenceStats.max.toFixed(2)}`
+    );
+  }
+};
 
 const DEFAULT_INSTANCE_STATE: AnalystInstanceState = {
     chatHistory: [],
@@ -1392,6 +1459,273 @@ VERIFY: All content fits in ${targetW}x${targetH}? Nothing cropped or off-screen
     return prompt;
   };
 
+  // ═══════════════════════════════════════════════════════════════════
+  // LAYERED DEFENSE HELPERS (Session 1: Foundation — no behavior change)
+  // These functions are added now but not wired in until Session 2.
+  // ═══════════════════════════════════════════════════════════════════
+
+  /**
+   * LAYER 1: Quality Gate (Penalty Scoring)
+   * Validates AI root overrides BEFORE group propagation.
+   * Falls back to proportional mapping if penalty score exceeds threshold.
+   *
+   * Catastrophic checks (instant fallback):
+   *   1. All at origin (REEL pattern)
+   *   6. NaN/Infinity values
+   *
+   * Scored checks (accumulate penalties):
+   *   2. Duplicate positions >30% — penalty 2
+   *   3. Overflow >30% — penalty 2
+   *   4. Bunched layout (layer-inclusive bbox) — penalty 1
+   *   5. Mostly off-screen layers (>80% invisible) — penalty 1 per layer (max 3)
+   *   7. Extreme scales — penalty 1 per layer (max 2)
+   */
+  interface QualityGateResult {
+    overrides: LayerOverride[];
+    wasReplaced: boolean;
+    reason?: string;
+    penaltyScore?: number;
+  }
+
+  const proportionalFallback = (
+    overrides: LayerOverride[],
+    coordsMap: Map<string, { x: number; y: number; w: number; h: number }>,
+    sX: number, sY: number, sW: number, sH: number,
+    tW: number, tH: number, propScale: number,
+    containerName: string, aspectRatioDiff: number, scaleFactor: number,
+    reason: string
+  ): QualityGateResult => {
+    console.warn(`[Analyst] QUALITY GATE: ${reason}. Falling back to proportional mapping.`);
+
+    logDefenseTrigger({
+      timestamp: Date.now(),
+      containerName,
+      sourceDims: { w: sW, h: sH },
+      targetDims: { w: tW, h: tH },
+      aspectRatioDiff,
+      scaleFactor,
+      layer: 'QUALITY_GATE',
+      trigger: reason,
+      aiOverrideCount: overrides.length
+    });
+
+    const result = overrides.map(o => {
+      if (o.layoutRole === 'background') return o; // keep bg as-is
+      const c = coordsMap.get(o.layerId);
+      if (!c) return o;
+      return {
+        ...o, // preserve layoutRole, linkedAnchorId, edgeAnchor from AI
+        xOffset: Math.round(((c.x - sX) / sW) * tW),
+        yOffset: Math.round(((c.y - sY) / sH) * tH),
+        individualScale: propScale,
+      };
+    });
+
+    return { overrides: result, wasReplaced: true, reason };
+  };
+
+  const validateAndSanitizeOverrides = (
+    overrides: LayerOverride[],
+    allLayers: { id: string; name: string; coords: { x: number; y: number; w: number; h: number }; isVisible: boolean }[],
+    sourceBounds: { x: number; y: number; w: number; h: number },
+    targetBounds: { w: number; h: number },
+    containerName: string,
+    aspectRatioDiff: number,
+    scaleFactor: number
+  ): QualityGateResult => {
+    const { w: tW, h: tH } = targetBounds;
+    const { x: sX, y: sY, w: sW, h: sH } = sourceBounds;
+    const propScale = Math.min(tW / sW, tH / sH);
+    const coordsMap = new Map(allLayers.map(l => [l.id, l.coords]));
+    const nonBg = overrides.filter(o => o.layoutRole !== 'background');
+
+    if (nonBg.length < 2) return { overrides, wasReplaced: false };
+
+    // ── CATASTROPHIC CHECK 1: All non-bg at origin (instant fallback) ──
+    if (nonBg.every(o => Math.abs(o.xOffset ?? 0) < QUALITY_GATE_ORIGIN_THRESHOLD_PX
+                      && Math.abs(o.yOffset ?? 0) < QUALITY_GATE_ORIGIN_THRESHOLD_PX)) {
+      return proportionalFallback(overrides, coordsMap, sX, sY, sW, sH, tW, tH, propScale,
+        containerName, aspectRatioDiff, scaleFactor, 'all non-bg at origin [CATASTROPHIC]');
+    }
+
+    // ── CATASTROPHIC CHECK 6: NaN/Infinity (instant fallback) ──
+    const invalidValues = nonBg.filter(o =>
+      !isFinite(o.xOffset ?? 0) || !isFinite(o.yOffset ?? 0) ||
+      !isFinite(o.individualScale ?? 1)
+    );
+    if (invalidValues.length > 0) {
+      return proportionalFallback(overrides, coordsMap, sX, sY, sW, sH, tW, tH, propScale,
+        containerName, aspectRatioDiff, scaleFactor,
+        `NaN/Infinity values (${invalidValues.length} layers) [CATASTROPHIC]`);
+    }
+
+    // ── SCORED CHECKS: accumulate penalties ──
+    let penaltyScore = 0;
+    const penalties: string[] = [];
+
+    // SCORED CHECK 2: Duplicate positions >30% — penalty 2
+    const posKeys = new Set(nonBg.map(o =>
+      `${Math.round(o.xOffset ?? 0)}|${Math.round(o.yOffset ?? 0)}`
+    ));
+    if (posKeys.size < nonBg.length * QUALITY_GATE_DUPLICATE_THRESHOLD) {
+      penaltyScore += 2;
+      penalties.push(`duplicate positions (${posKeys.size}/${nonBg.length} unique) [+2]`);
+    }
+
+    // SCORED CHECK 3: Overflow >30% — penalty 2
+    let overflowCount = 0;
+    for (const ov of nonBg) {
+      const c = coordsMap.get(ov.layerId);
+      if (!c) continue;
+      const s = ov.individualScale ?? propScale;
+      if ((ov.xOffset ?? 0) + c.w * s > tW * 1.1 ||
+          (ov.yOffset ?? 0) + c.h * s > tH * 1.1) {
+        overflowCount++;
+      }
+    }
+    if (overflowCount > nonBg.length * QUALITY_GATE_OVERFLOW_THRESHOLD) {
+      penaltyScore += 2;
+      penalties.push(`overflow (${overflowCount}/${nonBg.length} exceed target) [+2]`);
+    }
+
+    // SCORED CHECK 4: Bunched layout (LAYER-INCLUSIVE bounding box) — penalty 1
+    {
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      for (const ov of nonBg) {
+        const c = coordsMap.get(ov.layerId);
+        const x = ov.xOffset ?? 0;
+        const y = ov.yOffset ?? 0;
+        const s = ov.individualScale ?? propScale;
+        minX = Math.min(minX, x);
+        minY = Math.min(minY, y);
+        maxX = Math.max(maxX, x + (c ? c.w * s : 0));
+        maxY = Math.max(maxY, y + (c ? c.h * s : 0));
+      }
+      const bboxW = maxX - minX;
+      const bboxH = maxY - minY;
+      const bboxArea = bboxW * bboxH;
+      const targetArea = tW * tH;
+      if (bboxArea < targetArea * QUALITY_GATE_BUNCHED_AREA_THRESHOLD) {
+        penaltyScore += 1;
+        penalties.push(
+          `bunched layout (bbox ${bboxW.toFixed(0)}x${bboxH.toFixed(0)} = ` +
+          `${(bboxArea / targetArea * 100).toFixed(1)}% of target) [+1]`
+        );
+      }
+    }
+
+    // SCORED CHECK 5: Mostly off-screen layers — penalty 1 per layer (max 3)
+    {
+      let offscreenCount = 0;
+      for (const ov of nonBg) {
+        const c = coordsMap.get(ov.layerId);
+        if (!c) continue;
+        const s = ov.individualScale ?? propScale;
+        const x = ov.xOffset ?? 0;
+        const y = ov.yOffset ?? 0;
+        const layerW = c.w * s;
+        const layerH = c.h * s;
+        const layerArea = layerW * layerH;
+        if (layerArea <= 0) continue;
+
+        const visibleLeft = Math.max(0, x);
+        const visibleTop = Math.max(0, y);
+        const visibleRight = Math.min(tW, x + layerW);
+        const visibleBottom = Math.min(tH, y + layerH);
+        const visibleW = Math.max(0, visibleRight - visibleLeft);
+        const visibleH = Math.max(0, visibleBottom - visibleTop);
+        const visibleArea = visibleW * visibleH;
+
+        const invisibleRatio = 1 - (visibleArea / layerArea);
+        if (invisibleRatio > QUALITY_GATE_OFFSCREEN_THRESHOLD) {
+          offscreenCount++;
+        }
+      }
+      if (offscreenCount > 0) {
+        const penalty = Math.min(offscreenCount, 3);
+        penaltyScore += penalty;
+        penalties.push(`${offscreenCount} layers >80% off-screen [+${penalty}]`);
+      }
+    }
+
+    // SCORED CHECK 7: Extreme scales — penalty 1 per layer (max 2)
+    const extremeScales = nonBg.filter(o => {
+      const s = o.individualScale ?? propScale;
+      return s < QUALITY_GATE_EXTREME_SCALE_MIN || s > QUALITY_GATE_EXTREME_SCALE_MAX;
+    });
+    if (extremeScales.length > 0) {
+      const penalty = Math.min(extremeScales.length, 2);
+      const scales = extremeScales.map(o => (o.individualScale ?? propScale).toFixed(2)).join(', ');
+      penaltyScore += penalty;
+      penalties.push(`extreme scales (${extremeScales.length} layers: ${scales}) [+${penalty}]`);
+    }
+
+    // ── EVALUATE COMBINED SCORE ──
+    if (penaltyScore >= QUALITY_GATE_PENALTY_THRESHOLD) {
+      const combinedReason = `penalty score ${penaltyScore}/${QUALITY_GATE_PENALTY_THRESHOLD}: ${penalties.join('; ')}`;
+      return proportionalFallback(overrides, coordsMap, sX, sY, sW, sH, tW, tH, propScale,
+        containerName, aspectRatioDiff, scaleFactor, combinedReason);
+    }
+
+    // Log penalties even when below threshold (telemetry)
+    if (penalties.length > 0) {
+      console.log(
+        `[Analyst] Quality gate PASSED with penalties (${penaltyScore}/${QUALITY_GATE_PENALTY_THRESHOLD}): ` +
+        penalties.join('; ')
+      );
+    }
+
+    return { overrides, wasReplaced: false, penaltyScore };
+  };
+
+  /**
+   * LAYER 3: Dimension-Aware Clamping
+   * Clamps ALL non-background overrides so the entire layer is visible.
+   * Uses (targetDim - scaledLayerDim) as max instead of just targetDim.
+   */
+  const applyDimAwareClamp = (
+    overrides: LayerOverride[],
+    allLayersForClamp: { id: string; coords: { w: number; h: number } }[],
+    targetBounds: { w: number; h: number },
+    basePropScale: number,
+    containerName: string,
+    sourceBounds: { w: number; h: number }
+  ): LayerOverride[] => {
+    const { w: tW, h: tH } = targetBounds;
+    const dimMap = new Map(allLayersForClamp.map(l => [l.id, { w: l.coords.w, h: l.coords.h }]));
+
+    let clampedCount = 0;
+    for (const ov of overrides) {
+      if (ov.layoutRole === 'background') continue;
+      const origX = ov.xOffset;
+      const origY = ov.yOffset;
+      const dims = dimMap.get(ov.layerId);
+      const scale = ov.individualScale ?? basePropScale;
+      const scaledW = (dims?.w ?? 0) * scale;
+      const scaledH = (dims?.h ?? 0) * scale;
+
+      ov.xOffset = Math.max(0, Math.min(ov.xOffset, Math.max(0, tW - scaledW)));
+      ov.yOffset = Math.max(0, Math.min(ov.yOffset, Math.max(0, tH - scaledH)));
+      if (origX !== ov.xOffset || origY !== ov.yOffset) clampedCount++;
+    }
+
+    if (clampedCount > 0) {
+      console.log(`[Analyst] Clamped ${clampedCount} overrides to target bounds ${tW}x${tH} (dimension-aware)`);
+      logDefenseTrigger({
+        timestamp: Date.now(),
+        containerName,
+        sourceDims: { w: sourceBounds.w, h: sourceBounds.h },
+        targetDims: { w: tW, h: tH },
+        aspectRatioDiff: Math.abs((sourceBounds.w / sourceBounds.h) - (tW / tH)),
+        scaleFactor: basePropScale,
+        layer: 'DIM_AWARE_CLAMP',
+        trigger: `${clampedCount} overrides clamped (post-quality-gate)`
+      });
+    }
+
+    return overrides;
+  };
+
   const performAnalysis = async (index: number, history: ChatMessage[]) => {
       const sourceData = getSourceData(index);
       const targetData = getTargetData(index);
@@ -1415,6 +1749,88 @@ VERIFY: All content fits in ${targetW}x${targetH}? Nothing cropped or off-screen
       setAnalysisStages(prev => ({ ...prev, [index]: 'comprehension' }));
 
       try {
+        // ═══════════════════════════════════════════════════════════════════
+        // LAYER 0: FAST PATH MONITORING (Data Gathering Phase)
+        // When geometry is stable, log eligibility but STILL RUN AI (default).
+        // Set ENABLE_FAST_PATH_AUTO_SKIP=true to enable auto-skip after data gathering.
+        // ═══════════════════════════════════════════════════════════════════
+        {
+            const sW = sourceData.container.bounds.w;
+            const sH = sourceData.container.bounds.h;
+            const tW = targetData.bounds.w;
+            const tH = targetData.bounds.h;
+            const sourceRatio = sW / sH;
+            const targetRatio = tW / tH;
+            const ratioMismatch = Math.abs(sourceRatio - targetRatio);
+            const scaleFactor = Math.min(tW / sW, tH / sH);
+
+            const isFastPathEligible = ratioMismatch <= FAST_PATH_ASPECT_TOLERANCE
+                && scaleFactor >= FAST_PATH_SCALE_MIN
+                && scaleFactor <= FAST_PATH_SCALE_MAX;
+
+            if (isFastPathEligible) {
+                logDefenseTrigger({
+                    timestamp: Date.now(),
+                    containerName: targetData.name.toUpperCase(),
+                    sourceDims: { w: sW, h: sH },
+                    targetDims: { w: tW, h: tH },
+                    aspectRatioDiff: ratioMismatch,
+                    scaleFactor,
+                    layer: 'FAST_PATH_ELIGIBLE',
+                    trigger: `geometry stable (ratio-diff=${ratioMismatch.toFixed(3)}, scale=${scaleFactor.toFixed(3)})`
+                });
+
+                if (ENABLE_FAST_PATH_AUTO_SKIP) {
+                    console.log(
+                        `[Analyst] FAST PATH AUTO-SKIP: Geometry stable. ` +
+                        `Skipping AI — UNIFIED_FIT is optimal.`
+                    );
+
+                    const fastStrategy: LayoutStrategy = {
+                        method: 'GEOMETRIC',
+                        spatialLayout: 'UNIFIED_FIT',
+                        suggestedScale: scaleFactor,
+                        anchor: 'CENTER',
+                        generativePrompt: '',
+                        reasoning: `Fast path: geometry stable (ratio-diff ${ratioMismatch.toFixed(3)}, scale ${scaleFactor.toFixed(3)}). AI skipped.`,
+                        overrides: [],
+                        forceGeometryChange: false,
+                        knowledgeMuted: isMuted,
+                    };
+
+                    const newAiMessage: ChatMessage = {
+                        id: Date.now().toString(),
+                        role: 'model',
+                        parts: [{ text: `[FAST PATH] Geometry stable — UNIFIED_FIT (${scaleFactor.toFixed(2)}x). AI skipped.` }],
+                        strategySnapshot: fastStrategy,
+                        timestamp: Date.now()
+                    };
+
+                    const finalHistory = [...history, newAiMessage];
+                    updateInstanceState(index, {
+                        chatHistory: finalHistory,
+                        layoutStrategy: fastStrategy
+                    });
+
+                    registerResolved(id, `source-out-${index}`, {
+                        ...sourceData,
+                        aiStrategy: { ...fastStrategy, isExplicitIntent: false },
+                        previewUrl: undefined,
+                        targetDimensions: { w: tW, h: tH }
+                    } as MappingContext);
+
+                    setAnalysisStages(prev => ({ ...prev, [index]: 'complete' }));
+                    return; // Skip AI — finally{} block still clears spinner
+                } else {
+                    console.log(
+                        `[Analyst] FAST PATH ELIGIBLE (monitoring mode): ` +
+                        `ratio-diff=${ratioMismatch.toFixed(3)}, scale=${scaleFactor.toFixed(3)}. ` +
+                        `Proceeding with AI for comparison.`
+                    );
+                }
+            }
+        }
+
         // Extract source pixels once for all stages
         const sourcePixelsBase64 = await extractSourcePixels(sourceData.layers as SerializableLayer[], sourceData.container.bounds);
         const base64Clean = sourcePixelsBase64 ? sourcePixelsBase64.split(',')[1] : '';
@@ -1698,6 +2114,44 @@ VERIFY: All content fits in ${targetW}x${targetH}? Nothing cropped or off-screen
         // Track AI override count before propagation (used to skip Stage 3 if AI produced nothing)
         const aiOverrideCount = (json.overrides as LayerOverride[]).length;
 
+        // ═══════════════════════════════════════════════════════════════════
+        // LAYER 1: Quality Gate — validate root overrides before propagation
+        // ═══════════════════════════════════════════════════════════════════
+        const sourceW = sourceData.container.bounds.w;
+        const sourceH = sourceData.container.bounds.h;
+        const targetW = targetData.bounds.w;
+        const targetH = targetData.bounds.h;
+        const aspectRatioDiff = Math.abs((sourceW / sourceH) - (targetW / targetH));
+        const scaleFactor = Math.min(targetW / sourceW, targetH / sourceH);
+
+        const qualityResult = validateAndSanitizeOverrides(
+          json.overrides as LayerOverride[],
+          allLayers,
+          sourceData.container.bounds,
+          targetData.bounds,
+          targetData.name.toUpperCase(),
+          aspectRatioDiff,
+          scaleFactor
+        );
+
+        if (qualityResult.wasReplaced) {
+          json.overrides = qualityResult.overrides;
+          console.warn(`[Analyst] Quality gate replaced overrides: ${qualityResult.reason}`);
+        }
+
+        // ═══════════════════════════════════════════════════════════════════
+        // LAYER 3: Dim-aware clamp on ALL accepted overrides
+        // ═══════════════════════════════════════════════════════════════════
+        const basePropScale = Math.min(targetW / sourceW, targetH / sourceH);
+        applyDimAwareClamp(
+          json.overrides as LayerOverride[],
+          allLayers,
+          targetData.bounds,
+          basePropScale,
+          targetData.name.toUpperCase(),
+          sourceData.container.bounds
+        );
+
         // --- GROUP OVERRIDE PROPAGATION ---
         // When AI provides an override for a group, propagate transform to all descendants.
         // This allows the AI to position groups as units (typically 5-15 items) instead of
@@ -1765,44 +2219,7 @@ VERIFY: All content fits in ${targetW}x${targetH}? Nothing cropped or off-screen
             }
         }
 
-        // --- COORDINATE SANITY CHECK ---
-        // If AI returned near-zero positions for all non-background layers,
-        // coordinates are likely relative (0-1) instead of absolute pixels.
-        // Recalculate from source layer positions as proportional pixel mapping.
-        {
-            const nonBgOverrides = (json.overrides as LayerOverride[]).filter(
-                o => o.layoutRole !== 'background'
-            );
-            if (nonBgOverrides.length >= 3) {
-                const maxAbsX = Math.max(...nonBgOverrides.map(o => Math.abs(o.xOffset ?? 0)));
-                const maxAbsY = Math.max(...nonBgOverrides.map(o => Math.abs(o.yOffset ?? 0)));
-                const tW = targetData.bounds.w;
-                const tH = targetData.bounds.h;
-                const sX = sourceData.container.bounds.x;
-                const sY = sourceData.container.bounds.y;
-                const sW = sourceData.container.bounds.w;
-                const sH = sourceData.container.bounds.h;
-
-                // If max position < 2% of target dimension, positions are almost certainly invalid
-                if (maxAbsX < tW * 0.02 && maxAbsY < tH * 0.02) {
-                    console.warn(
-                        `[Analyst] SANITY CHECK: Positions appear invalid (max x=${maxAbsX.toFixed(1)}, y=${maxAbsY.toFixed(1)} ` +
-                        `for ${tW}×${tH} target). Recalculating from source layer positions.`
-                    );
-                    const layerCoordsMap = new Map(allLayers.map(l => [l.id, l.coords]));
-                    for (const ov of json.overrides as LayerOverride[]) {
-                        if (ov.layoutRole === 'background') continue;
-                        const coords = layerCoordsMap.get(ov.layerId);
-                        if (coords) {
-                            const relX = (coords.x - sX) / sW;
-                            const relY = (coords.y - sY) / sH;
-                            ov.xOffset = Math.round(relX * tW);
-                            ov.yOffset = Math.round(relY * tH);
-                        }
-                    }
-                }
-            }
-        }
+        // (Old COORDINATE SANITY CHECK deleted — fully subsumed by LAYER 1 Quality Gate)
 
         // --- PER-LAYER OVERRIDE VALIDATION ---
         // Ensure every layer has an override (generate defaults for missing layers)
@@ -2158,58 +2575,85 @@ VERIFY: All content fits in ${targetW}x${targetH}? Nothing cropped or off-screen
               confidence: verification.confidenceScore
             });
 
-            // Apply corrections if verification failed and corrections are provided
-            // MERGE corrections over existing overrides instead of full replacement
-            if (!verification.passed && verification.correctedOverrides && verification.correctedOverrides.length > 0) {
-              console.log('[Analyst] Merging verification corrections:', verification.correctedOverrides.length, 'override corrections over', json.overrides.length, 'existing');
-              const correctionMap = new Map<string, LayerOverride>();
-              for (const corr of verification.correctedOverrides) {
-                correctionMap.set(corr.layerId, corr);
-              }
-              // Merge: Stage 3 corrections override Stage 2 values per-layer, uncorrected layers keep Stage 2 values
-              const mergedOverrides = json.overrides.map((existing: LayerOverride) => {
-                const correction = correctionMap.get(existing.layerId);
-                if (correction) {
-                  return { ...existing, ...correction }; // correction fields overwrite existing
-                }
-                return existing;
-              });
-              // Add any corrections for layers not in Stage 2 (shouldn't normally happen)
-              for (const [layerId, corr] of correctionMap) {
-                if (!json.overrides.some((o: LayerOverride) => o.layerId === layerId)) {
-                  mergedOverrides.push(corr);
-                }
-              }
-              // Clamp all coordinates to target bounds — reject off-screen positions
-              const tW = targetData.bounds.w;
-              const tH = targetData.bounds.h;
-              let clampedCount = 0;
-              for (const ov of mergedOverrides) {
-                if (ov.layoutRole === 'background') continue; // backgrounds always at 0,0
-                const origX = ov.xOffset;
-                const origY = ov.yOffset;
-                ov.xOffset = Math.max(0, Math.min(ov.xOffset, tW));
-                ov.yOffset = Math.max(0, Math.min(ov.yOffset, tH));
-                if (origX !== ov.xOffset || origY !== ov.yOffset) clampedCount++;
-              }
-              if (clampedCount > 0) {
-                console.log(`[Analyst] Clamped ${clampedCount} overrides to target bounds ${tW}x${tH}`);
-              }
+            // Log confidence for telemetry
+            logConfidence(targetData.name.toUpperCase(), verification.confidenceScore ?? 0);
 
-              finalStrategy = {
-                ...json,
-                overrides: mergedOverrides,
-                suggestedScale: verification.correctedScale ?? json.suggestedScale,
-                reasoning: json.reasoning + '\n\n[STAGE 3 VERIFICATION CORRECTIONS MERGED]\n' +
-                  verification.issues.map(i => `- ${i.type}: ${i.description}`).join('\n')
-              };
+            if (!verification.passed && verification.correctedOverrides && verification.correctedOverrides.length > 0) {
+                if ((verification.confidenceScore ?? 0) >= STAGE3_CONFIDENCE_THRESHOLD) {
+                    // LAYER 2: High confidence — merge corrections
+                    console.log('[Analyst] Merging verification corrections:',
+                        verification.correctedOverrides.length, 'override corrections over',
+                        json.overrides.length, 'existing');
+
+                    const correctionMap = new Map<string, LayerOverride>();
+                    for (const corr of verification.correctedOverrides) {
+                        correctionMap.set(corr.layerId, corr);
+                    }
+                    const mergedOverrides = json.overrides.map((existing: LayerOverride) => {
+                        const correction = correctionMap.get(existing.layerId);
+                        return correction ? { ...existing, ...correction } : existing;
+                    });
+                    for (const [layerId, corr] of correctionMap) {
+                        if (!json.overrides.some((o: LayerOverride) => o.layerId === layerId)) {
+                            mergedOverrides.push(corr);
+                        }
+                    }
+
+                    // Re-run Layer 3 clamp on merged corrections (Stage 3 may have introduced new edge positions)
+                    const stage3PropScale = Math.min(
+                        targetData.bounds.w / sourceData.container.bounds.w,
+                        targetData.bounds.h / sourceData.container.bounds.h
+                    );
+                    applyDimAwareClamp(
+                        mergedOverrides,
+                        allLayers,
+                        targetData.bounds,
+                        stage3PropScale,
+                        targetData.name.toUpperCase(),
+                        sourceData.container.bounds
+                    );
+
+                    finalStrategy = {
+                        ...json,
+                        overrides: mergedOverrides,
+                        suggestedScale: verification.correctedScale ?? json.suggestedScale,
+                        reasoning: json.reasoning + '\n\n[STAGE 3 VERIFICATION CORRECTIONS MERGED]\n' +
+                            verification.issues.map(i => `- ${i.type}: ${i.description}`).join('\n')
+                    };
+                } else {
+                    // LAYER 2: Low confidence — reject corrections, keep Stage 2 output
+                    console.warn(
+                        `[Analyst] CONFIDENCE GATE: Rejecting ${verification.correctedOverrides.length} Stage 3 corrections ` +
+                        `(confidence=${(verification.confidenceScore ?? 0).toFixed(2)} < ${STAGE3_CONFIDENCE_THRESHOLD}). ` +
+                        `Keeping Stage 2 layout.`
+                    );
+
+                    logDefenseTrigger({
+                        timestamp: Date.now(),
+                        containerName: targetData.name.toUpperCase(),
+                        sourceDims: { w: sourceData.container.bounds.w, h: sourceData.container.bounds.h },
+                        targetDims: { w: targetData.bounds.w, h: targetData.bounds.h },
+                        aspectRatioDiff: Math.abs((sourceData.container.bounds.w / sourceData.container.bounds.h) - (targetData.bounds.w / targetData.bounds.h)),
+                        scaleFactor: Math.min(targetData.bounds.w / sourceData.container.bounds.w, targetData.bounds.h / sourceData.container.bounds.h),
+                        layer: 'CONFIDENCE_GATE',
+                        trigger: `rejected ${verification.correctedOverrides.length} corrections (score=${(verification.confidenceScore ?? 0).toFixed(2)})`,
+                        confidence: verification.confidenceScore
+                    });
+
+                    finalStrategy = {
+                        ...json,
+                        reasoning: json.reasoning +
+                            `\n\n[STAGE 3 CORRECTIONS REJECTED: confidence ${(verification.confidenceScore ?? 0).toFixed(2)} < ${STAGE3_CONFIDENCE_THRESHOLD}]\n` +
+                            verification.issues.map(i => `- ${i.type}: ${i.description}`).join('\n')
+                    };
+                }
             } else if (!verification.passed) {
-              console.log('[Analyst] Verification failed but no corrections provided:', verification.issues);
-              finalStrategy = {
-                ...json,
-                reasoning: json.reasoning + '\n\n[STAGE 3 VERIFICATION WARNINGS]\n' +
-                  verification.issues.map(i => `- ${i.type}: ${i.description} (Suggested: ${i.suggestedFix})`).join('\n')
-              };
+                console.log('[Analyst] Verification failed but no corrections provided:', verification.issues);
+                finalStrategy = {
+                    ...json,
+                    reasoning: json.reasoning + '\n\n[STAGE 3 VERIFICATION WARNINGS]\n' +
+                        verification.issues.map(i => `- ${i.type}: ${i.description} (Suggested: ${i.suggestedFix})`).join('\n')
+                };
             }
           } catch (verifyError) {
             console.warn('[Analyst] Stage 3 verification failed, using Stage 2 result:', verifyError);
@@ -2241,7 +2685,7 @@ VERIFY: All content fits in ${targetW}x${targetH}? Nothing cropped or off-screen
 
         const augmentedContext: MappingContext = {
             ...sourceData,
-            aiStrategy: { ...finalStrategy, isExplicitIntent },
+            aiStrategy: { ...finalStrategy, isExplicitIntent, sourceAnalysis },
             previewUrl: undefined,
             targetDimensions: targetData ? { w: targetData.bounds.w, h: targetData.bounds.h } : undefined
         };

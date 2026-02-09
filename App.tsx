@@ -440,7 +440,7 @@ const App: React.FC = () => {
                     console.warn("Design Reviewer 'Knowledge' input requires a Knowledge Node or Inspector source.");
                     return;
                 }
-            } else if (handle.startsWith('payload-in')) {
+            } else if (handle.startsWith('source-in')) {
                 // Accepts output from Remapper OR Container Resolver (Direct Bridge Exception)
                 if (sourceNode.type !== 'remapper' && sourceNode.type !== 'containerResolver') {
                     console.warn("Reviewer 'Payload Input' requires a Remapper or Container Resolver source.");
